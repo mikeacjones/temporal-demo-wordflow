@@ -99,19 +99,6 @@ func TestCampaignUpgradeSignalContinuesAsNew(t *testing.T) {
 	require.Equal(t, state.Levels, nextRun.State.Levels)
 }
 
-func TestDailyChallengeUpgradeSignalInterruptsItsTimer(t *testing.T) {
-	state := &DailyWordflowChallengeState{NextDate: "2026-09-24"}
-	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
-	env.SetStartTime(time.Date(2026, 9, 23, 12, 0, 0, 0, torontoLocation))
-	env.RegisterDelayedCallback(func() { requestVersionUpgrade(env) }, time.Millisecond)
-
-	env.ExecuteWorkflow(DailyWordflowChallengeWorkflow, DailyWordflowChallengeWorkflowInput{State: state})
-
-	var nextRun DailyWordflowChallengeWorkflowInput
-	require.NoError(t, converter.GetDefaultDataConverter().FromPayloads(requireVersionUpgrade(t, env).Input, &nextRun))
-	require.Equal(t, state, nextRun.State)
-}
-
 func TestLevelUpgradeSignalContinuesAsNew(t *testing.T) {
 	state := &WordflowLevelState{
 		WorkflowID: "wordflow-level/player/campaign/1",

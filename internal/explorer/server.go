@@ -265,7 +265,7 @@ func (s *Server) viewer(request *http.Request) viewer {
 func listFilter(playerID string) string {
 	public := []string{
 		fmt.Sprintf("WorkflowId = '%s'", workflows.CatalogWorkflowID),
-		fmt.Sprintf("WorkflowId = '%s'", workflows.DailyWordflowChallengeWorkflowID),
+		fmt.Sprintf("WorkflowId STARTS_WITH '%s'", workflows.CampaignGeneratorWorkflowIDPrefix),
 		fmt.Sprintf("WorkflowId = '%s'", workflows.LeaderboardWorkflowID),
 		"WorkflowId STARTS_WITH 'wordflow-campaign/'",
 	}
@@ -284,8 +284,9 @@ func listFilter(playerID string) string {
 }
 
 func canViewWorkflowID(playerID, workflowID string) bool {
-	if workflowID == workflows.CatalogWorkflowID || workflowID == workflows.DailyWordflowChallengeWorkflowID ||
-		workflowID == workflows.LeaderboardWorkflowID || strings.HasPrefix(workflowID, "wordflow-campaign/") {
+	if workflowID == workflows.CatalogWorkflowID || workflowID == workflows.LeaderboardWorkflowID ||
+		strings.HasPrefix(workflowID, workflows.CampaignGeneratorWorkflowIDPrefix) ||
+		strings.HasPrefix(workflowID, "wordflow-campaign/") {
 		return true
 	}
 	return playerOwnsWorkflow(playerID, workflowID)
@@ -336,8 +337,8 @@ func workflowKind(workflowID string) string {
 	switch {
 	case workflowID == workflows.CatalogWorkflowID:
 		return "catalog"
-	case workflowID == workflows.DailyWordflowChallengeWorkflowID:
-		return "daily generator"
+	case strings.HasPrefix(workflowID, workflows.CampaignGeneratorWorkflowIDPrefix):
+		return "campaign generator"
 	case workflowID == workflows.LeaderboardWorkflowID:
 		return "leaderboard"
 	case strings.HasPrefix(workflowID, "wordflow-campaign/"):
@@ -361,7 +362,7 @@ func workflowVisibility(workflowID string) string {
 func safeWorkflowType(name string) string {
 	known := []string{
 		workflows.CatalogWorkflowName,
-		workflows.DailyWordflowChallengeWorkflowName,
+		workflows.WordflowCampaignGeneratorWorkflowName,
 		workflows.WordflowCampaignWorkflowName,
 		workflows.PlayerWorkflowName,
 		workflows.WordflowLevelWorkflowName,
@@ -388,7 +389,7 @@ func safeOperationName(name string) string {
 		workflows.SignalLeaderboardScore,
 		workflows.ActivityRegisterCampaign,
 		workflows.ActivityUnregisterCampaign,
-		workflows.ActivityGenerateDailyWordflowChallenge,
+		workflows.ActivityGenerateWordflowCampaign,
 		workflows.ActivityResolveWordflowLevel,
 		workflows.ActivitySpendPoints,
 		workflows.ActivityPublishLeaderboard,

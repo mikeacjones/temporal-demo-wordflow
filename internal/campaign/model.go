@@ -6,7 +6,10 @@ const GameWordflow = "wordflow"
 
 type Kind string
 
-const KindDailyChallenge Kind = "daily-challenge"
+const (
+	KindDailyChallenge Kind = "daily-challenge"
+	KindMonthlyPack    Kind = "monthly-pack"
+)
 
 type Status string
 

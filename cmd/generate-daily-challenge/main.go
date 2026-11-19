@@ -70,15 +70,17 @@ func main() {
 		log.Fatal(err)
 	}
 
-	input := workflows.GenerateDailyWordflowChallengeActivityInput{
+	endsAt := startsAt.AddDate(0, 0, 1)
+	input := workflows.GenerateWordflowCampaignActivityInput{
+		Kind:          campaign.KindDailyChallenge,
 		Date:          *date,
 		StartsAt:      startsAt,
-		EndsAt:        startsAt.AddDate(0, 0, 1),
+		EndsAt:        &endsAt,
 		ExcludedWords: excludedWords,
 	}
 	var generated workflows.WordflowCampaignWorkflowInput
 	for attempt := 1; attempt <= 5; attempt++ {
-		generated, err = (&activities.DailyChallenges{}).GenerateDailyWordflowChallenge(context.Background(), input)
+		generated, err = (&activities.CampaignGenerator{}).GenerateWordflowCampaign(context.Background(), input)
 		if err == nil {
 			break
 		}

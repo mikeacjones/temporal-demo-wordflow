@@ -24,7 +24,7 @@ func TestReplayLiveHistories(t *testing.T) {
 
 	replayer := worker.NewWorkflowReplayer()
 	replayer.RegisterWorkflowWithOptions(CatalogWorkflow, workflow.RegisterOptions{Name: CatalogWorkflowName})
-	replayer.RegisterWorkflowWithOptions(DailyWordflowChallengeWorkflow, workflow.RegisterOptions{Name: DailyWordflowChallengeWorkflowName})
+	replayer.RegisterWorkflowWithOptions(WordflowCampaignGeneratorWorkflow, workflow.RegisterOptions{Name: WordflowCampaignGeneratorWorkflowName})
 	replayer.RegisterWorkflowWithOptions(WordflowCampaignWorkflow, workflow.RegisterOptions{Name: WordflowCampaignWorkflowName})
 	replayer.RegisterWorkflowWithOptions(PlayerWorkflow, workflow.RegisterOptions{Name: PlayerWorkflowName})
 	replayer.RegisterWorkflowWithOptions(WordflowLevelWorkflow, workflow.RegisterOptions{Name: WordflowLevelWorkflowName})
