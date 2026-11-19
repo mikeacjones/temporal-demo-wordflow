@@ -2,36 +2,40 @@ package activities
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/mjones/temporal-word-game/internal/campaign"
+	"github.com/mjones/temporal-word-game/internal/dictionary"
 	"github.com/mjones/temporal-word-game/internal/game"
 	"github.com/mjones/temporal-word-game/internal/workflows"
 
 	"go.temporal.io/sdk/temporal"
 )
 
-type generatedCampaign struct {
-	Description string                   `json:"description"`
-	Levels      []generatedWordflowLevel `json:"levels"`
-}
+const levelAnswerCount = 10
 
-type generatedWordflowLevel struct {
-	Title   string   `json:"title"`
-	Letters string   `json:"letters"`
-	Words   []string `json:"words"`
-}
+const campaignAgentInstructions = `You design levels for Wordflow, a word puzzle game. Respond only by calling tools, never with prose.
 
-const campaignAgentInstructions = `You design Wordflow puzzles with tools. Respond only by calling tools, never with prose. Draft each level, test it with check_words and check_level, and fix whatever they report. Finish by calling submit_campaign with the complete campaign. Submitting runs the final validation: if it is rejected, read the reason, fix the campaign, and submit again.`
+How a level plays: the player sees a bank of eight letters and an empty crossword. They spell words from the bank, using each letter no more often than it appears in the bank, and each correct answer fills in its place in the crossword. The level ends when the player has found all ten answers, so every answer must be a word a typical player would think of.
+
+The crossword is laid out automatically. Each answer is placed across or down and must cross an answer already placed, on a shared letter. Answers can't touch side by side, and the cell before and after each answer must be empty. Answers that share letters with many others are easiest to connect.
+
+How to build the campaign:
+1. Pick an eight-letter anchor word for each level; the level's letter bank is exactly the anchor's letters, and the anchor is one of its answers. suggest_anchors lists common anchors whose letters differ from the levels you have already saved. Prefer those, so levels don't keep producing the same short words.
+2. Call find_words with the letter bank. It returns every common word the bank can spell, leaving out answers from recent campaigns and showing which words a saved level already uses. Choose answers only from that list.
+3. Save the level with set_level. It checks everything, including whether the crossword connects and whether an answer repeats another level, and lists every problem at once. A level is saved only when it passes. To change a saved level, set the same level number again.
+4. When every level is saved, call submit_campaign with the campaign description.
+
+You can make several tool calls in one turn; they run in the order you make them.`
 
 // campaignSpec is everything that differs between the kinds of campaign the
-// generator can produce. The tool schema and level validation are shared.
+// generator can produce. The tools and level checks are shared.
 type campaignSpec struct {
 	levelCount int
 	prompt     func(workflows.CampaignRequest) string
-	// level applies the kind's timing, scoring, and hint rules to a validated level.
+	// level applies the kind's timing, scoring, and hint rules to a checked level.
 	level      func(game.LevelDefinition) game.LevelDefinition
 	definition func(input workflows.CampaignRequest, description string) campaign.Definition
 }
@@ -96,28 +100,24 @@ var wordflowGameSummary = campaign.GameSummary{
 }
 
 const levelRules = `For every level:
-- provide exactly eight uppercase letters and exactly ten unique English answers
-- every answer must be at least three letters and spellable from the letter multiset without using a letter too many times
-- choose a familiar eight-letter anchor word first, use exactly its letters for the letters field in any order, and include that anchor in the answers; the anchor must be a common standalone word, not a plural, conjugation, obscure derivative, or invented compound
-- the letters field is only a letter bank and need not itself spell a word; every entry in words, including the eight-letter anchor, must be a real familiar word
-- make the words interconnected enough to form one connected crossword
-- use familiar modern dictionary words; never use proper nouns, abbreviations, offensive terms, archaic words, or dubious comparative forms
-- do not pad the answer list with both a base word and its simple plural or past tense, and do not reuse an answer in another level
-- give the level a short, energetic title
-
-Check every level before you submit. check_words tests a letter bank and answer list quickly. check_level tests a whole level, including whether the crossword connects. Neither can see your other levels, and the final submission also rejects an answer that appears in two levels.`
+- the letter bank is exactly the letters of one common eight-letter anchor word, and the anchor is one of the ten answers; the anchor should be a standalone word, not a plural or a verb form such as an -ED or -ING word
+- choose exactly ten answers of three to eight letters, all from find_words for that bank
+- don't pad the answers with both a word and its simple plural or past tense
+- no answer may appear in two levels
+- keep every answer family-friendly
+- give the level a short, energetic title`
 
 func exclusionRule(excluded []string, scope string) string {
 	if len(excluded) == 0 {
 		return "There are no recent answers to exclude."
 	}
-	return "Do not use any of these answers from " + scope + ": " + strings.Join(excluded, ", ") + "."
+	return "find_words already leaves out the answers from " + scope + ", and set_level rejects them."
 }
 
 func dailyChallengePrompt(input workflows.CampaignRequest) string {
 	return fmt.Sprintf(`Create the Daily Wordflow Challenge for %s.
 
-The tool call must define exactly three especially difficult but fair levels. %s
+Build exactly three especially difficult but fair levels: favor longer and less obvious answers from find_words over the easiest three- and four-letter words. %s
 
 %s
 
@@ -135,7 +135,7 @@ Finish by calling submit_campaign.`,
 func monthlyPackPrompt(input workflows.CampaignRequest) string {
 	return fmt.Sprintf(`Create the Wordflow Monthly Pack for %s.
 
-The tool call must define exactly nine levels that share one fun, family-friendly theme you choose for the month. Order them from approachable to challenging, so the first three suit a newcomer and the last three need real vocabulary. %s
+Build exactly nine levels that share one fun, family-friendly theme you choose for the month; level titles carry the theme. Order them from approachable to challenging, so the first three suit a newcomer and the last three need real vocabulary. %s
 
 %s
 
@@ -148,120 +148,177 @@ Finish by calling submit_campaign.`,
 	)
 }
 
-func excludedAnswers(request workflows.CampaignRequest) map[string]bool {
-	answers := make(map[string]bool, len(request.ExcludedWords))
+// takenAnswers maps every answer a level may not use to where it was used:
+// recent campaigns, and each saved level other than skipLevel.
+func takenAnswers(request workflows.CampaignRequest, draft workflows.CampaignDraft, skipLevel int) map[string]string {
+	taken := make(map[string]string, len(request.ExcludedWords))
 	for _, answer := range request.ExcludedWords {
-		answers[strings.ToUpper(strings.TrimSpace(answer))] = true
+		taken[strings.ToUpper(strings.TrimSpace(answer))] = "a recent campaign"
 	}
-	return answers
+	for number, level := range draft {
+		if number == skipLevel {
+			continue
+		}
+		for _, answer := range level.Words {
+			taken[answer] = fmt.Sprintf("level %d", number)
+		}
+	}
+	return taken
 }
 
-func buildCampaign(spec campaignSpec, input workflows.CampaignRequest, generated generatedCampaign) (workflows.WordflowCampaignWorkflowInput, error) {
-	if input.Date == "" || input.StartsAt.IsZero() || (input.EndsAt != nil && !input.EndsAt.After(input.StartsAt)) {
-		return workflows.WordflowCampaignWorkflowInput{}, temporal.NewNonRetryableApplicationError(
-			"campaign date and a valid active window are required", "invalid_campaign_input", nil,
-		)
+// checkLevel normalizes a level and lists everything wrong with it, in a form
+// the agent can act on. The crossword layout is checked only when nothing else
+// is wrong, because it depends on the final answers.
+func checkLevel(words *dictionary.Dictionary, level workflows.CampaignLevel, taken map[string]string) (workflows.CampaignLevel, []string) {
+	level.Title = strings.TrimSpace(level.Title)
+	level.Letters = strings.ToUpper(strings.TrimSpace(level.Letters))
+	answers := make([]string, len(level.Words))
+	for index, value := range level.Words {
+		answers[index] = strings.ToUpper(strings.TrimSpace(value))
 	}
-	generated.Description = strings.TrimSpace(generated.Description)
-	if generated.Description == "" {
-		return workflows.WordflowCampaignWorkflowInput{}, fmt.Errorf("campaign description is required")
+	level.Words = answers
+
+	var problems []string
+	if level.Title == "" {
+		problems = append(problems, "the level needs a title")
 	}
-	if len(generated.Levels) != spec.levelCount {
-		return workflows.WordflowCampaignWorkflowInput{}, fmt.Errorf("campaign must contain exactly %d levels", spec.levelCount)
+	if len(level.Letters) != game.MaxWordflowLetters || !isUppercaseLetters(level.Letters) {
+		// Without a valid bank nothing else can be judged.
+		return level, append(problems, fmt.Sprintf("letters must be exactly %d letters A-Z", game.MaxWordflowLetters))
+	}
+	if len(answers) != levelAnswerCount {
+		problems = append(problems, fmt.Sprintf("the level needs exactly %d answers, not %d", levelAnswerCount, len(answers)))
 	}
 
-	levels := make([]game.Puzzle, 0, len(generated.Levels))
-	allAnswers := excludedAnswers(input)
-	for index, level := range generated.Levels {
-		definition, err := validateGeneratedWordflowLevel(index+1, level, allAnswers)
-		if err != nil {
-			return workflows.WordflowCampaignWorkflowInput{}, err
-		}
-		puzzle, err := game.BuildPuzzle(index+1, spec.level(definition))
-		if err != nil {
-			return workflows.WordflowCampaignWorkflowInput{}, fmt.Errorf("build generated campaign: %w", err)
-		}
-		levels = append(levels, puzzle)
-	}
-
-	return workflows.WordflowCampaignWorkflowInput{
-		Definition: spec.definition(input, generated.Description),
-		Levels:     levels,
-	}, nil
-}
-
-func validateGeneratedWordflowLevel(levelNumber int, generated generatedWordflowLevel, allAnswers map[string]bool) (game.LevelDefinition, error) {
-	title := strings.TrimSpace(generated.Title)
-	letters := strings.ToUpper(strings.TrimSpace(generated.Letters))
-	if title == "" {
-		return game.LevelDefinition{}, fmt.Errorf("level %d title is required", levelNumber)
-	}
-	if len([]rune(letters)) != game.MaxWordflowLetters || !asciiLettersOnly(letters) {
-		return game.LevelDefinition{}, fmt.Errorf("level %d must have exactly %d uppercase letters", levelNumber, game.MaxWordflowLetters)
-	}
-	if len(generated.Words) != 10 {
-		return game.LevelDefinition{}, fmt.Errorf("level %d must have exactly 10 words", levelNumber)
-	}
-
-	words := make([]string, 0, len(generated.Words))
-	levelAnswers := map[string]bool{}
-	usesFullQueue := false
-	for _, value := range generated.Words {
-		answer := strings.ToUpper(strings.TrimSpace(value))
-		length := len([]rune(answer))
+	seen := map[string]bool{}
+	hasAnchor := false
+	for _, answer := range answers {
 		switch {
-		case length < 3 || length > game.MaxWordflowLetters || !asciiLettersOnly(answer):
-			return game.LevelDefinition{}, fmt.Errorf("level %d has invalid answer %q", levelNumber, value)
-		case levelAnswers[answer]:
-			return game.LevelDefinition{}, fmt.Errorf("level %d repeats answer %q", levelNumber, answer)
-		case allAnswers[answer]:
-			return game.LevelDefinition{}, fmt.Errorf("campaign reuses answer %q", answer)
-		case !spellsFromLetters(answer, letters):
-			return game.LevelDefinition{}, fmt.Errorf("level %d answer %q cannot be spelled from %q", levelNumber, answer, letters)
+		case len(answer) < 3 || len(answer) > game.MaxWordflowLetters || !isUppercaseLetters(answer):
+			problems = append(problems, fmt.Sprintf("%q must be 3 to %d letters A-Z", answer, game.MaxWordflowLetters))
+			continue
+		case seen[answer]:
+			problems = append(problems, fmt.Sprintf("%s appears twice", answer))
+			continue
 		}
-		levelAnswers[answer] = true
-		allAnswers[answer] = true
-		usesFullQueue = usesFullQueue || length == game.MaxWordflowLetters
-		words = append(words, answer)
+		seen[answer] = true
+		switch {
+		case !dictionary.CanSpell(answer, level.Letters):
+			problems = append(problems, fmt.Sprintf("%s cannot be spelled from %s", answer, level.Letters))
+		case !words.IsEnglish(answer):
+			problems = append(problems, fmt.Sprintf("%s is not an English word", answer))
+		case !words.IsCommon(answer):
+			problems = append(problems, fmt.Sprintf("%s is too obscure for players to find; use a common word from find_words", answer))
+		case taken[answer] != "":
+			problems = append(problems, fmt.Sprintf("%s is already used in %s", answer, taken[answer]))
+		}
+		hasAnchor = hasAnchor || len(answer) == game.MaxWordflowLetters
 	}
-	if !usesFullQueue {
-		return game.LevelDefinition{}, fmt.Errorf("level %d has no answer using all %d letters", levelNumber, game.MaxWordflowLetters)
+	if !hasAnchor {
+		problems = append(problems, fmt.Sprintf("no answer uses all %d letters; include the anchor word", game.MaxWordflowLetters))
 	}
-	for answer := range levelAnswers {
-		if levelAnswers[answer+"S"] || levelAnswers[answer+"ES"] {
-			return game.LevelDefinition{}, fmt.Errorf("level %d pads its answers with a plural form of %q", levelNumber, answer)
+	for _, answer := range answers {
+		if seen[answer+"S"] || seen[answer+"ES"] {
+			problems = append(problems, fmt.Sprintf("%s and its plural are both answers; drop one", answer))
 		}
 		pastTense := answer + "ED"
 		if strings.HasSuffix(answer, "E") {
 			pastTense = answer + "D"
 		}
-		if levelAnswers[pastTense] {
-			return game.LevelDefinition{}, fmt.Errorf("level %d pads its answers with a past-tense form of %q", levelNumber, answer)
+		if seen[pastTense] {
+			problems = append(problems, fmt.Sprintf("%s and its past tense are both answers; drop one", answer))
 		}
 	}
 
-	return game.LevelDefinition{Title: title, Letters: letters, Words: words}, nil
+	if len(problems) == 0 {
+		if _, err := game.BuildPuzzle(1, levelDefinition(level)); err != nil {
+			problems = append(problems, "the answers cannot be laid out as one connected crossword; swap one or two answers for words that share more letters with the others")
+		}
+	}
+	return level, problems
 }
 
-func asciiLettersOnly(value string) bool {
+func levelDefinition(level workflows.CampaignLevel) game.LevelDefinition {
+	return game.LevelDefinition{Title: level.Title, Letters: level.Letters, Words: level.Words}
+}
+
+// buildCampaign checks the whole draft again and turns it into the campaign to
+// start. Problems are the agent's to fix; an error is a request the agent
+// cannot fix.
+func buildCampaign(words *dictionary.Dictionary, spec campaignSpec, request workflows.CampaignRequest, draft workflows.CampaignDraft, description string) (workflows.WordflowCampaignWorkflowInput, []string, error) {
+	if request.Date == "" || request.StartsAt.IsZero() || (request.EndsAt != nil && !request.EndsAt.After(request.StartsAt)) {
+		return workflows.WordflowCampaignWorkflowInput{}, nil, temporal.NewNonRetryableApplicationError(
+			"campaign date and a valid active window are required", "invalid_campaign_input", nil,
+		)
+	}
+
+	var problems []string
+	description = strings.TrimSpace(description)
+	if description == "" {
+		problems = append(problems, "the campaign needs a description")
+	}
+	if missing := missingLevels(spec, draft); len(missing) > 0 {
+		problems = append(problems, fmt.Sprintf("levels %v are not saved yet; save them with set_level", missing))
+	}
+	if len(problems) > 0 {
+		return workflows.WordflowCampaignWorkflowInput{}, problems, nil
+	}
+
+	// Each level is checked against recent campaigns and the levels before it,
+	// so an answer used twice is reported once, on its later level.
+	taken := takenAnswers(request, nil, 0)
+	levels := make([]game.Puzzle, 0, spec.levelCount)
+	for number := 1; number <= spec.levelCount; number++ {
+		level, levelProblems := checkLevel(words, draft[number], taken)
+		for _, problem := range levelProblems {
+			problems = append(problems, fmt.Sprintf("level %d: %s", number, problem))
+		}
+		for _, answer := range level.Words {
+			taken[answer] = fmt.Sprintf("level %d", number)
+		}
+		if len(levelProblems) > 0 {
+			continue
+		}
+		puzzle, err := game.BuildPuzzle(number, spec.level(levelDefinition(level)))
+		if err != nil {
+			return workflows.WordflowCampaignWorkflowInput{}, nil, fmt.Errorf("build checked level %d: %w", number, err)
+		}
+		levels = append(levels, puzzle)
+	}
+	if len(problems) > 0 {
+		return workflows.WordflowCampaignWorkflowInput{}, problems, nil
+	}
+
+	return workflows.WordflowCampaignWorkflowInput{
+		Definition: spec.definition(request, description),
+		Levels:     levels,
+	}, nil, nil
+}
+
+func savedLevels(draft workflows.CampaignDraft) []int {
+	numbers := make([]int, 0, len(draft))
+	for number := range draft {
+		numbers = append(numbers, number)
+	}
+	sort.Ints(numbers)
+	return numbers
+}
+
+func missingLevels(spec campaignSpec, draft workflows.CampaignDraft) []int {
+	missing := []int{}
+	for number := 1; number <= spec.levelCount; number++ {
+		if _, ok := draft[number]; !ok {
+			missing = append(missing, number)
+		}
+	}
+	return missing
+}
+
+func isUppercaseLetters(value string) bool {
 	for _, letter := range value {
-		if letter > unicode.MaxASCII || letter < 'A' || letter > 'Z' {
+		if letter < 'A' || letter > 'Z' {
 			return false
 		}
 	}
 	return value != ""
-}
-
-func spellsFromLetters(word, letters string) bool {
-	available := map[rune]int{}
-	for _, letter := range letters {
-		available[letter]++
-	}
-	for _, letter := range word {
-		available[letter]--
-		if available[letter] < 0 {
-			return false
-		}
-	}
-	return true
 }
