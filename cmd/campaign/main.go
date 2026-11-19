@@ -37,9 +37,8 @@ func main() {
 	}
 	defer temporalClient.Close()
 
-	registration, err := bootstrap.StartWordflowCampaign(context.Background(), temporalClient, *taskQueue, input)
-	if err != nil {
+	if err := bootstrap.StartWordflowCampaign(context.Background(), temporalClient, *taskQueue, input); err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("started %s as %s\n", registration.Definition.ID, registration.WorkflowID)
+	fmt.Printf("started %s as %s\n", input.Definition.ID, workflows.WordflowCampaignWorkflowID(input.Definition.ID))
 }

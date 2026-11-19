@@ -18,10 +18,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mjones/temporal-word-game/internal/bootstrap"
 	"github.com/mjones/temporal-word-game/internal/campaign"
+	"github.com/mjones/temporal-word-game/internal/catalog"
 	"github.com/mjones/temporal-word-game/internal/explorer"
 	"github.com/mjones/temporal-word-game/internal/game"
+	"github.com/mjones/temporal-word-game/internal/player"
+	"github.com/mjones/temporal-word-game/internal/store"
 	"github.com/mjones/temporal-word-game/internal/workflows"
 
 	"go.temporal.io/api/enums/v1"
@@ -33,18 +35,32 @@ import (
 //go:embed web/*
 var webFiles embed.FS
 
+// Store is the long-term data the API reads and changes directly: player
+// records, the campaign catalog and the leaderboard.
+type Store interface {
+	CreatePlayer(ctx context.Context, state player.State) error
+	Player(ctx context.Context, playerID string) (player.State, error)
+	UpdatePlayer(ctx context.Context, playerID string, change func(*player.State) error) (player.State, error)
+	Campaigns(ctx context.Context) ([]catalog.Registration, error)
+	Leaderboard(ctx context.Context, limit int) ([]game.LeaderboardRank, error)
+}
+
+const leaderboardSize = 50
+
 type Server struct {
 	temporal         client.Client
+	store            Store
 	taskQueue        string
 	sessionJWTSecret []byte
 }
 
-func New(temporalClient client.Client, taskQueue, temporalNamespace, sessionJWTSecret string) http.Handler {
+func New(temporalClient client.Client, dataStore Store, taskQueue, temporalNamespace, sessionJWTSecret string) http.Handler {
 	if len(sessionJWTSecret) < 32 {
 		panic("SESSION_JWT_SECRET must contain at least 32 characters")
 	}
 	server := &Server{
 		temporal:         temporalClient,
+		store:            dataStore,
 		taskQueue:        taskQueue,
 		sessionJWTSecret: []byte(sessionJWTSecret),
 	}
@@ -55,7 +71,6 @@ func New(temporalClient client.Client, taskQueue, temporalNamespace, sessionJWTS
 	mux.HandleFunc("GET /api/session", server.openSession)
 	mux.HandleFunc("DELETE /api/session", server.logOut)
 	mux.HandleFunc("GET /api/me", server.getPlayer)
-	mux.HandleFunc("GET /api/me/workflow-link", server.getPlayerWorkflowLink)
 	mux.HandleFunc("POST /api/me/streak-freeze", server.buyStreakFreeze)
 	mux.HandleFunc("GET /api/catalog", server.getCatalog)
 	mux.HandleFunc("GET /api/me/campaigns/{campaign}/completion", server.getCompletion)
@@ -171,28 +186,22 @@ func (s *Server) signUp(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, http.StatusBadRequest, err)
 		return
 	}
-	if input.RequestID == "" {
-		input.RequestID = newID()
-	}
 
-	view, rawToken, expiresAt, err := s.authenticatePlayer(request.Context(), username, displayName,
-		passwordHash, input.RequestID, true)
-	if err != nil {
-		var applicationError *temporal.ApplicationError
-		if errors.As(err, &applicationError) && applicationError.Type() == "invalid_credentials" {
+	ctx := request.Context()
+	account := player.New(username, displayName, passwordHash, time.Now().UTC())
+	err = s.store.CreatePlayer(ctx, account)
+	if errors.Is(err, store.ErrExists) {
+		// A retried sign-up with the same password signs in; anything else is a taken username.
+		account, err = s.signIn(ctx, username, passwordHash)
+		if err != nil {
 			writeError(writer, http.StatusConflict, errors.New("username is already registered with a different password"))
 			return
 		}
-		writeTemporalError(writer, err)
+	} else if err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
 		return
 	}
-	response, err := s.sessionResponse(request.Context(), view)
-	if err != nil {
-		writeTemporalError(writer, err)
-		return
-	}
-	setSessionCookie(writer, request, rawToken, expiresAt)
-	writeJSON(writer, http.StatusCreated, response)
+	s.startSession(writer, request, http.StatusCreated, account)
 }
 
 func (s *Server) logIn(writer http.ResponseWriter, request *http.Request) {
@@ -206,38 +215,50 @@ func (s *Server) logIn(writer http.ResponseWriter, request *http.Request) {
 		writeInvalidLogin(writer)
 		return
 	}
-	if input.RequestID == "" {
-		input.RequestID = newID()
-	}
 	passwordHash, err := passwordHash(username, input.Password)
 	if err != nil {
 		writeInvalidLogin(writer)
 		return
 	}
 
-	view, rawToken, expiresAt, err := s.authenticatePlayer(request.Context(), username, "",
-		passwordHash, input.RequestID, false)
-	if err != nil {
-		var notFound *serviceerror.NotFound
-		if errors.As(err, &notFound) {
-			writeInvalidLogin(writer)
-			return
-		}
-		var applicationError *temporal.ApplicationError
-		if errors.As(err, &applicationError) {
-			writeInvalidLogin(writer)
-			return
-		}
-		writeTemporalError(writer, err)
+	account, err := s.signIn(request.Context(), username, passwordHash)
+	if errors.Is(err, store.ErrNotFound) || player.IsRule(err) {
+		writeInvalidLogin(writer)
 		return
 	}
-	response, err := s.sessionResponse(request.Context(), view)
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
+		return
+	}
+	s.startSession(writer, request, http.StatusOK, account)
+}
+
+// signIn checks the password and records the visit, which also ends a lapsed streak.
+func (s *Server) signIn(ctx context.Context, username, passwordHash string) (player.State, error) {
+	return s.store.UpdatePlayer(ctx, username, func(state *player.State) error {
+		if err := state.CheckPassword(passwordHash); err != nil {
+			return err
+		}
+		state.SignIn(time.Now().UTC())
+		return nil
+	})
+}
+
+func (s *Server) startSession(writer http.ResponseWriter, request *http.Request, status int, account player.State) {
+	issuedAt := time.Now().UTC()
+	expiresAt := issuedAt.Add(sessionLifetime)
+	rawToken, err := newSessionToken(s.sessionJWTSecret, account.PlayerID, issuedAt, expiresAt)
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
+		return
+	}
+	response, err := s.sessionResponse(request.Context(), account)
 	if err != nil {
 		writeTemporalError(writer, err)
 		return
 	}
 	setSessionCookie(writer, request, rawToken, expiresAt)
-	writeJSON(writer, http.StatusOK, response)
+	writeJSON(writer, status, response)
 }
 
 func writeInvalidLogin(writer http.ResponseWriter) {
@@ -258,66 +279,13 @@ func (s *Server) openSession(writer http.ResponseWriter, request *http.Request) 
 	writeJSON(writer, http.StatusOK, response)
 }
 
-type authenticatePlayerUpdate struct {
-	DisplayName  string `json:"displayName"`
-	PasswordHash string `json:"passwordHash"`
-	Register     bool   `json:"register"`
-}
-
-func (s *Server) authenticatePlayer(ctx context.Context, username, displayName, passwordHash, requestID string,
-	register bool,
-) (game.PlayerView, string, time.Time, error) {
-	issuedAt := time.Now().UTC()
-	expiresAt := issuedAt.Add(sessionLifetime)
-	rawToken, err := newSessionToken(s.sessionJWTSecret, username, issuedAt, expiresAt)
-	if err != nil {
-		return game.PlayerView{}, "", time.Time{}, err
-	}
-	update := authenticatePlayerUpdate{
-		DisplayName: displayName, PasswordHash: passwordHash, Register: register,
-	}
-	workflowID := workflows.PlayerWorkflowID(username)
-	var view game.PlayerView
-
-	if !register {
-		err := s.update(ctx, workflowID, requestID, workflows.UpdateAuthenticatePlayer, update, &view)
-		return view, rawToken, expiresAt, err
-	}
-
-	start := s.temporal.NewWithStartWorkflowOperation(client.StartWorkflowOptions{
-		ID: workflowID, TaskQueue: s.taskQueue,
-		WorkflowIDConflictPolicy: enums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-		WorkflowIDReusePolicy:    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
-	}, workflows.PlayerWorkflowName, workflows.PlayerWorkflowInput{PlayerID: username})
-	handle, err := s.temporal.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
-		StartWorkflowOperation: start,
-		UpdateOptions: client.UpdateWorkflowOptions{
-			UpdateID: requestID, UpdateName: workflows.UpdateAuthenticatePlayer,
-			WaitForStage: client.WorkflowUpdateStageCompleted, Args: []any{update},
-		},
-	})
-	if err == nil {
-		err = handle.Get(ctx, &view)
-	}
-	return view, rawToken, expiresAt, err
-}
-
 func (s *Server) getPlayer(writer http.ResponseWriter, request *http.Request) {
-	player, err := s.authenticatedPlayer(request)
+	account, err := s.authenticatedPlayer(request)
 	if err != nil {
 		writeError(writer, http.StatusUnauthorized, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, newPlayerResponse(player))
-}
-
-func (s *Server) getPlayerWorkflowLink(writer http.ResponseWriter, request *http.Request) {
-	playerID, err := s.authenticatedPlayerID(request)
-	if err != nil {
-		writeError(writer, http.StatusUnauthorized, err)
-		return
-	}
-	s.redirectWorkflowLink(writer, request, workflows.PlayerWorkflowID(playerID))
+	writeJSON(writer, http.StatusOK, newPlayerResponse(account.View()))
 }
 
 type sessionResponse struct {
@@ -419,23 +387,24 @@ type hintResponse struct {
 }
 
 func (s *Server) getCatalog(writer http.ResponseWriter, request *http.Request) {
-	player, err := s.authenticatedPlayer(request)
+	account, err := s.authenticatedPlayer(request)
 	if err != nil {
 		writeError(writer, http.StatusUnauthorized, err)
 		return
 	}
-	response, err := s.catalog(request.Context(), player)
+	response, err := s.catalog(request.Context(), account)
 	if err != nil {
-		writeTemporalError(writer, err)
+		writeError(writer, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(writer, http.StatusOK, response)
 }
 
-func (s *Server) sessionResponse(ctx context.Context, player game.PlayerView) (sessionResponse, error) {
-	response := sessionResponse{Player: newPlayerResponse(player)}
-	if player.ActiveGame != nil {
-		gameView, err := s.queryGame(ctx, player.ActiveGame.WorkflowID)
+func (s *Server) sessionResponse(ctx context.Context, account player.State) (sessionResponse, error) {
+	view := account.View()
+	response := sessionResponse{Player: newPlayerResponse(view)}
+	if view.ActiveGame != nil {
+		gameView, err := s.queryGame(ctx, view.ActiveGame.WorkflowID)
 		if err != nil {
 			return sessionResponse{}, err
 		}
@@ -443,7 +412,7 @@ func (s *Server) sessionResponse(ctx context.Context, player game.PlayerView) (s
 		response.Game = &compactGame
 		return response, nil
 	}
-	catalog, err := s.catalog(ctx, player)
+	catalog, err := s.catalog(ctx, account)
 	if err != nil {
 		return sessionResponse{}, err
 	}
@@ -451,68 +420,16 @@ func (s *Server) sessionResponse(ctx context.Context, player game.PlayerView) (s
 	return response, nil
 }
 
-func (s *Server) catalog(ctx context.Context, player game.PlayerView) (catalogResponse, error) {
-	var catalogView campaign.CatalogView
-	query := campaign.QueryInput{Player: campaignPlayerProgress(player)}
-	queryCatalog := func() (*client.QueryWorkflowWithOptionsResponse, error) {
-		return s.temporal.QueryWorkflowWithOptions(ctx, &client.QueryWorkflowWithOptionsRequest{
-			WorkflowID:           workflows.CatalogWorkflowID,
-			QueryType:            workflows.QueryCatalog,
-			Args:                 []any{query},
-			QueryRejectCondition: enums.QUERY_REJECT_CONDITION_NOT_OPEN,
-		})
-	}
-
-	result, err := queryCatalog()
-	start := result == nil || result.QueryRejected != nil || result.QueryResult == nil
-	if err != nil {
-		var notFound *serviceerror.NotFound
-		if !errors.As(err, &notFound) {
-			return catalogResponse{}, err
-		}
-		start = true
-	}
-	if start {
-		defaultCampaign, startErr := bootstrap.StartDefaultCampaign(ctx, s.temporal, s.taskQueue)
-		if startErr != nil {
-			return catalogResponse{}, startErr
-		}
-		start := s.temporal.NewWithStartWorkflowOperation(client.StartWorkflowOptions{
-			ID:                       workflows.CatalogWorkflowID,
-			TaskQueue:                s.taskQueue,
-			WorkflowIDConflictPolicy: enums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-			WorkflowIDReusePolicy:    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
-		}, workflows.CatalogWorkflowName, workflows.CatalogWorkflowInput{
-			InitialCampaigns: []workflows.CampaignRegistration{defaultCampaign},
-		})
-		handle, startErr := s.temporal.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
-			StartWorkflowOperation: start,
-			UpdateOptions: client.UpdateWorkflowOptions{
-				UpdateID: newID(), UpdateName: workflows.UpdateOpenCatalog,
-				WaitForStage: client.WorkflowUpdateStageCompleted,
-				Args:         []any{[]workflows.CampaignRegistration{defaultCampaign}},
-			},
-		})
-		if startErr != nil {
-			return catalogResponse{}, startErr
-		}
-		var campaignCount int
-		if err = handle.Get(ctx, &campaignCount); err == nil {
-			result, err = queryCatalog()
-		}
-	}
+func (s *Server) catalog(ctx context.Context, account player.State) (catalogResponse, error) {
+	registrations, err := s.store.Campaigns(ctx)
 	if err != nil {
 		return catalogResponse{}, err
 	}
-	if result == nil || result.QueryRejected != nil || result.QueryResult == nil {
-		return catalogResponse{}, errors.New("catalog workflow is not open")
-	}
-	if err := result.QueryResult.Get(&catalogView); err != nil {
-		return catalogResponse{}, err
-	}
-
-	response := catalogResponse{Campaigns: make([]catalogCampaignResponse, 0, len(catalogView.Campaigns))}
-	for _, view := range catalogView.Campaigns {
+	now := time.Now().UTC()
+	progress := account.Progress()
+	response := catalogResponse{Campaigns: make([]catalogCampaignResponse, 0, len(registrations))}
+	for _, registration := range registrations {
+		view := catalog.View(registration, progress, now)
 		response.Campaigns = append(response.Campaigns, newCatalogCampaignResponse(view,
 			workflowExplorerURL(view.WorkflowID, "")))
 	}
@@ -533,17 +450,19 @@ func (s *Server) buyStreakFreeze(writer http.ResponseWriter, request *http.Reque
 		writeError(writer, http.StatusBadRequest, err)
 		return
 	}
-	if input.RequestID == "" {
-		input.RequestID = newID()
-	}
 
-	var view game.PlayerView
-	if err := s.update(request.Context(), workflows.PlayerWorkflowID(playerID), input.RequestID,
-		workflows.UpdateBuyStreakFreeze, workflows.BuyStreakFreezeInput{}, &view); err != nil {
-		writeTemporalError(writer, err)
+	account, err := s.store.UpdatePlayer(request.Context(), playerID, func(state *player.State) error {
+		return state.BuyStreakFreeze(time.Now().UTC())
+	})
+	if player.IsRule(err) {
+		writeError(writer, http.StatusConflict, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, newPlayerResponse(view))
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, newPlayerResponse(account.View()))
 }
 
 type startGameRequest struct {
@@ -563,18 +482,20 @@ func (s *Server) getCompletion(writer http.ResponseWriter, request *http.Request
 		return
 	}
 
+	// The level Workflow records its result just after the last move, so the
+	// player's record can lag the final guess by a moment.
 	deadline := time.Now().Add(5 * time.Second)
-	var player game.PlayerView
+	var account player.State
 	for {
-		player, err = s.queryPlayer(request.Context(), playerID)
+		account, err = s.store.Player(request.Context(), playerID)
 		if err != nil {
-			writeError(writer, http.StatusUnauthorized, err)
+			writeError(writer, http.StatusUnauthorized, errors.New("session is invalid or expired"))
 			return
 		}
-		if player.ActiveGame == nil {
+		if account.ActiveGame == nil {
 			break
 		}
-		if player.ActiveGame.CampaignID != campaignID || time.Now().After(deadline) {
+		if account.ActiveGame.CampaignID != campaignID || time.Now().After(deadline) {
 			writeError(writer, http.StatusConflict, errors.New("level completion is still being processed"))
 			return
 		}
@@ -588,20 +509,20 @@ func (s *Server) getCompletion(writer http.ResponseWriter, request *http.Request
 		}
 	}
 
-	catalog, err := s.catalog(request.Context(), player)
+	campaigns, err := s.catalog(request.Context(), account)
 	if err != nil {
-		writeTemporalError(writer, err)
+		writeError(writer, http.StatusInternalServerError, err)
 		return
 	}
 	var completedCampaign *catalogCampaignResponse
-	for index := range catalog.Campaigns {
-		if catalog.Campaigns[index].CampaignID == campaignID {
-			completedCampaign = &catalog.Campaigns[index]
+	for index := range campaigns.Campaigns {
+		if campaigns.Campaigns[index].CampaignID == campaignID {
+			completedCampaign = &campaigns.Campaigns[index]
 			break
 		}
 	}
 	writeJSON(writer, http.StatusOK, completionResponse{
-		Player:   newPlayerResponse(player),
+		Player:   newPlayerResponse(account.View()),
 		Campaign: completedCampaign,
 	})
 }
@@ -627,11 +548,44 @@ func (s *Server) startGame(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
+	if input.Level < 1 {
+		writeError(writer, http.StatusBadRequest, errors.New("level must be 1 or more"))
+		return
+	}
+
+	// One call starts the level's Workflow and runs its start-level Update,
+	// which claims the level in the player's record and returns the board.
+	ctx := request.Context()
+	start := s.temporal.NewWithStartWorkflowOperation(client.StartWorkflowOptions{
+		ID:                       workflows.WordflowLevelWorkflowID(playerID, campaignID, input.Level),
+		TaskQueue:                s.taskQueue,
+		WorkflowIDConflictPolicy: enums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+	}, workflows.WordflowLevelWorkflowName, workflows.WordflowLevelWorkflowInput{
+		PlayerID: playerID, CampaignID: campaignID, Level: input.Level,
+	})
+	handle, err := s.temporal.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
+		StartWorkflowOperation: start,
+		UpdateOptions: client.UpdateWorkflowOptions{
+			UpdateID: input.RequestID, UpdateName: workflows.UpdateStartLevel,
+			WaitForStage: client.WorkflowUpdateStageCompleted, Args: []any{workflows.StartLevelInput{}},
+		},
+	})
 	var result workflows.StartLevelResult
-	if err := s.update(request.Context(), workflows.PlayerWorkflowID(playerID), input.RequestID, workflows.UpdateStartLevel,
-		workflows.StartLevelInput{CampaignID: campaignID, Level: input.Level}, &result); err != nil {
+	if err == nil {
+		err = handle.Get(ctx, &result)
+	}
+	if err != nil {
 		writeTemporalError(writer, err)
 		return
+	}
+	if result.Player.DisplayName == "" {
+		// The level was already open; its Update didn't read the player's record.
+		account, err := s.store.Player(ctx, playerID)
+		if err != nil {
+			writeError(writer, http.StatusInternalServerError, err)
+			return
+		}
+		result.Player = account.View()
 	}
 	writeJSON(writer, http.StatusOK, startGameResponse{
 		Player: newPlayerResponse(result.Player),
@@ -792,28 +746,16 @@ func (s *Server) authenticatedPlayerID(request *http.Request) (string, error) {
 	return sessionCookie(request, s.sessionJWTSecret, time.Now())
 }
 
-func (s *Server) authenticatedPlayer(request *http.Request) (game.PlayerView, error) {
+func (s *Server) authenticatedPlayer(request *http.Request) (player.State, error) {
 	playerID, err := s.authenticatedPlayerID(request)
 	if err != nil {
-		return game.PlayerView{}, err
+		return player.State{}, err
 	}
-	return s.queryPlayer(request.Context(), playerID)
-}
-
-func (s *Server) queryPlayer(ctx context.Context, playerID string) (game.PlayerView, error) {
-	response, err := s.temporal.QueryWorkflowWithOptions(ctx, &client.QueryWorkflowWithOptionsRequest{
-		WorkflowID:           workflows.PlayerWorkflowID(playerID),
-		QueryType:            workflows.QueryPlayerState,
-		QueryRejectCondition: enums.QUERY_REJECT_CONDITION_NOT_OPEN,
-	})
-	if err != nil || response == nil || response.QueryRejected != nil || response.QueryResult == nil {
-		return game.PlayerView{}, errors.New("session is invalid or expired")
+	account, err := s.store.Player(request.Context(), playerID)
+	if err != nil {
+		return player.State{}, errors.New("session is invalid or expired")
 	}
-	var player game.PlayerView
-	if err := response.QueryResult.Get(&player); err != nil {
-		return game.PlayerView{}, errors.New("session is invalid or expired")
-	}
-	return player, nil
+	return account, nil
 }
 
 func (s *Server) queryGame(ctx context.Context, workflowID string) (game.GameView, error) {
@@ -834,51 +776,12 @@ func (s *Server) logOut(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) getLeaderboard(writer http.ResponseWriter, request *http.Request) {
-	query := func() (*client.QueryWorkflowWithOptionsResponse, error) {
-		return s.temporal.QueryWorkflowWithOptions(request.Context(), &client.QueryWorkflowWithOptionsRequest{
-			WorkflowID:           workflows.LeaderboardWorkflowID,
-			QueryType:            workflows.QueryLeaderboard,
-			QueryRejectCondition: enums.QUERY_REJECT_CONDITION_NOT_OPEN,
-		})
-	}
-
-	response, err := query()
-	start := response == nil || response.QueryRejected != nil || response.QueryResult == nil
+	entries, err := s.store.Leaderboard(request.Context(), leaderboardSize)
 	if err != nil {
-		var notFound *serviceerror.NotFound
-		if !errors.As(err, &notFound) {
-			writeTemporalError(writer, err)
-			return
-		}
-		start = true
-	}
-	if start {
-		_, err = s.temporal.ExecuteWorkflow(request.Context(), client.StartWorkflowOptions{
-			ID:                       workflows.LeaderboardWorkflowID,
-			TaskQueue:                s.taskQueue,
-			WorkflowIDConflictPolicy: enums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-			WorkflowIDReusePolicy:    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
-		}, workflows.LeaderboardWorkflowName, workflows.LeaderboardWorkflowInput{})
-		if err != nil {
-			writeTemporalError(writer, err)
-			return
-		}
-		response, err = query()
-		if err != nil {
-			writeTemporalError(writer, err)
-			return
-		}
-	}
-	if response == nil || response.QueryRejected != nil || response.QueryResult == nil {
-		writeTemporalError(writer, errors.New("leaderboard workflow is not open"))
+		writeError(writer, http.StatusInternalServerError, err)
 		return
 	}
-	var view game.LeaderboardView
-	if err := response.QueryResult.Get(&view); err != nil {
-		writeTemporalError(writer, err)
-		return
-	}
-	writeJSON(writer, http.StatusOK, view)
+	writeJSON(writer, http.StatusOK, game.LeaderboardView{Entries: entries})
 }
 
 func (s *Server) update(ctx context.Context, workflowID, updateID, updateName string, input, output any) error {
@@ -902,17 +805,6 @@ func workflowExplorerURL(workflowID, runID string) string {
 		query.Set("runId", runID)
 	}
 	return "/workflows/?" + query.Encode()
-}
-
-func campaignPlayerProgress(player game.PlayerView) campaign.PlayerProgress {
-	progress := campaign.PlayerProgress{
-		Campaigns: append([]campaign.PlayerCampaignProgress(nil), player.Campaigns...),
-	}
-	if player.ActiveGame != nil {
-		progress.ActiveCampaignID = player.ActiveGame.CampaignID
-		progress.ActiveLevel = player.ActiveGame.Level
-	}
-	return progress
 }
 
 func requestCampaignID(request *http.Request) (string, bool) {

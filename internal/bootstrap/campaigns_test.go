@@ -26,7 +26,7 @@ func TestTemporalFoundationsCampaignIsValid(t *testing.T) {
 }
 
 func TestPalmSpringsCampaignIsValid(t *testing.T) {
-	contents, err := os.ReadFile("../../deploy/terraform/campaigns/palm-springs-offsite-2026.json")
+	contents, err := os.ReadFile("../../campaigns/palm-springs-offsite-2026.json")
 	if err != nil {
 		t.Fatal(err)
 	}

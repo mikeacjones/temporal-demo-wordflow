@@ -35,10 +35,6 @@ type GameSummary struct {
 	Description string `json:"description"`
 }
 
-type CatalogView struct {
-	Campaigns []View `json:"campaigns"`
-}
-
 type RequiredLevel struct {
 	CampaignID string `json:"campaignId"`
 	Level      int    `json:"level"`
@@ -68,19 +64,6 @@ type Definition struct {
 	Unlock        UnlockPolicy `json:"unlock"`
 }
 
-type Summary struct {
-	CampaignID  string      `json:"campaignId"`
-	Kind        Kind        `json:"kind,omitempty"`
-	WorkflowID  string      `json:"workflowId"`
-	Game        GameSummary `json:"game"`
-	Title       string      `json:"title"`
-	Description string      `json:"description"`
-	Status      Status      `json:"status"`
-	StartsAt    *time.Time  `json:"startsAt,omitempty"`
-	EndsAt      *time.Time  `json:"endsAt,omitempty"`
-	TotalLevels int         `json:"totalLevels"`
-}
-
 type PlayerCampaignProgress struct {
 	CampaignID      string    `json:"campaignId"`
 	JoinedAt        time.Time `json:"joinedAt"`
@@ -95,10 +78,6 @@ type PlayerProgress struct {
 	Campaigns        []PlayerCampaignProgress `json:"campaigns"`
 	ActiveCampaignID string                   `json:"activeCampaignId,omitempty"`
 	ActiveLevel      int                      `json:"activeLevel,omitempty"`
-}
-
-type QueryInput struct {
-	Player PlayerProgress `json:"player"`
 }
 
 type LevelView struct {
@@ -134,11 +113,14 @@ type PointAward struct {
 
 // LevelResult is the small, game-independent result returned to a Player Workflow.
 type LevelResult struct {
-	GameID      string       `json:"gameId"`
-	CampaignID  string       `json:"campaignId"`
-	Level       int          `json:"level"`
-	Attempts    int          `json:"attempts"`
-	CompletedAt time.Time    `json:"completedAt"`
-	TimedOut    bool         `json:"timedOut,omitempty"`
-	Awards      []PointAward `json:"awards"`
+	GameID      string    `json:"gameId"`
+	CampaignID  string    `json:"campaignId"`
+	Level       int       `json:"level"`
+	Attempts    int       `json:"attempts"`
+	CompletedAt time.Time `json:"completedAt"`
+	TimedOut    bool      `json:"timedOut,omitempty"`
+	// Abandoned means the player left an untimed level alone until it expired.
+	// The level counts as neither played nor failed.
+	Abandoned bool         `json:"abandoned,omitempty"`
+	Awards    []PointAward `json:"awards"`
 }

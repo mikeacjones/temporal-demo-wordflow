@@ -14,11 +14,11 @@ import (
 )
 
 type WordflowLevelWorkflowInput struct {
-	PlayerID   string              `json:"playerId,omitempty"`
-	CampaignID string              `json:"campaignId,omitempty"`
-	Puzzle     game.Puzzle         `json:"puzzle,omitempty"`
-	StartedAt  time.Time           `json:"startedAt,omitempty"`
-	State      *WordflowLevelState `json:"state,omitempty"`
+	PlayerID   string `json:"playerId,omitempty"`
+	CampaignID string `json:"campaignId,omitempty"`
+	Level      int    `json:"level,omitempty"`
+	// State is the Continue-As-New checkpoint of a level already started.
+	State *WordflowLevelState `json:"state,omitempty"`
 }
 
 // WordflowLevelState is the complete Continue-As-New checkpoint for one level.
@@ -28,6 +28,7 @@ type WordflowLevelState struct {
 	CampaignID       string             `json:"campaignId"`
 	Puzzle           game.Puzzle        `json:"puzzle"`
 	StartedAt        time.Time          `json:"startedAt"`
+	LastMoveAt       time.Time          `json:"lastMoveAt,omitempty"`
 	FoundAnswers     []string           `json:"foundAnswers"`
 	RejectedWords    []string           `json:"rejectedWords"`
 	RevealedCells    []game.Position    `json:"revealedCells"`
@@ -39,9 +40,50 @@ type WordflowLevelState struct {
 	Hints            game.HintInventory `json:"hints"`
 	Complete         bool               `json:"complete"`
 	TimedOut         bool               `json:"timedOut,omitempty"`
+	Abandoned        bool               `json:"abandoned,omitempty"`
 	CompletedAt      time.Time          `json:"completedAt"`
 	TimedOutAt       time.Time          `json:"timedOutAt,omitempty"`
 	Score            game.GameScore     `json:"score"`
+}
+
+type StartLevelInput struct{}
+
+type StartLevelResult struct {
+	// Player is set when this Update opened the level, and empty when the
+	// level was already open.
+	Player game.PlayerView `json:"player"`
+	Game   game.GameView   `json:"game"`
+}
+
+type ClaimLevelActivityInput struct {
+	PlayerID        string    `json:"playerId"`
+	CampaignID      string    `json:"campaignId"`
+	Level           int       `json:"level"`
+	LevelWorkflowID string    `json:"levelWorkflowId"`
+	StartedAt       time.Time `json:"startedAt"`
+}
+
+type ClaimLevelResult struct {
+	Player      game.PlayerView `json:"player"`
+	Puzzle      game.Puzzle     `json:"puzzle"`
+	TotalLevels int             `json:"totalLevels"`
+}
+
+type SpendPointsActivityInput struct {
+	PlayerID        string `json:"playerId"`
+	LevelWorkflowID string `json:"levelWorkflowId"`
+	Amount          int    `json:"amount"`
+}
+
+type SpendPointsResult struct {
+	Spent     int `json:"spent"`
+	Remaining int `json:"remaining"`
+}
+
+type RecordLevelResultActivityInput struct {
+	PlayerID        string               `json:"playerId"`
+	LevelWorkflowID string               `json:"levelWorkflowId"`
+	Result          campaign.LevelResult `json:"result"`
 }
 
 type SubmitGuessInput struct {
@@ -54,16 +96,61 @@ type UseHintInput struct {
 
 var speedBonusPoints = []int{10, 7, 4}
 
+// untimedLevelIdleLimit ends a level with no time limit that nobody has
+// touched for a day, so the player can start it again and the Workflow's
+// Worker version can drain.
+const untimedLevelIdleLimit = 24 * time.Hour
+
+// WordflowLevelWorkflow is one player's attempt at one level. The API starts
+// it with Update-With-Start: the start-level Update claims the level in the
+// player's record and returns the opening board, then guesses and hints are
+// Updates until the level is solved, runs out of time, or sits idle too long.
+// The result goes back to the player's record before the Workflow ends.
 func WordflowLevelWorkflow(ctx workflow.Context, input WordflowLevelWorkflowInput) (campaign.LevelResult, error) {
-	state := initialWordflowLevelState(ctx, input)
-	// Paid hints await an Activity, so every level mutation shares this lock.
+	state := input.State
+	rejected := false
+	// Paid hints and the claim await Activities, so every level mutation shares this lock.
 	lock := workflow.NewMutex(ctx)
 	changed := workflow.NewBufferedChannel(ctx, 1)
 	upgrade := workflow.GetSignalChannel(ctx, SignalRequestVersionUpgrade)
 	continueRequested := false
+	activityCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{StartToCloseTimeout: 30 * time.Second})
 
 	if err := workflow.SetQueryHandler(ctx, QueryWordflowLevelState, func() (game.GameView, error) {
+		if state == nil {
+			return game.GameView{}, temporal.NewApplicationError("the level has not started", "level_not_started")
+		}
 		return wordflowLevelView(state), nil
+	}); err != nil {
+		return campaign.LevelResult{}, err
+	}
+
+	if err := workflow.SetUpdateHandler(ctx, UpdateStartLevel, func(updateCtx workflow.Context, _ StartLevelInput) (StartLevelResult, error) {
+		if err := lock.Lock(updateCtx); err != nil {
+			return StartLevelResult{}, err
+		}
+		defer lock.Unlock()
+
+		if state != nil {
+			return StartLevelResult{Game: wordflowLevelView(state)}, nil
+		}
+		info := workflow.GetInfo(updateCtx)
+		startedAt := workflow.Now(updateCtx)
+		var claim ClaimLevelResult
+		err := workflow.ExecuteActivity(workflow.WithActivityOptions(updateCtx, workflow.ActivityOptions{
+			StartToCloseTimeout: 30 * time.Second,
+			RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 3},
+		}), ActivityClaimLevel, ClaimLevelActivityInput{
+			PlayerID: input.PlayerID, CampaignID: input.CampaignID, Level: input.Level,
+			LevelWorkflowID: info.WorkflowExecution.ID, StartedAt: startedAt,
+		}).Get(updateCtx, &claim)
+		if err != nil {
+			// The player can't have this level now; the Workflow ends without a result.
+			rejected = true
+			return StartLevelResult{}, err
+		}
+		state = newWordflowLevelState(info.WorkflowExecution.ID, input.PlayerID, input.CampaignID, claim.Puzzle, startedAt)
+		return StartLevelResult{Player: claim.Player, Game: wordflowLevelView(state)}, nil
 	}); err != nil {
 		return campaign.LevelResult{}, err
 	}
@@ -74,6 +161,9 @@ func WordflowLevelWorkflow(ctx workflow.Context, input WordflowLevelWorkflowInpu
 		}
 		defer lock.Unlock()
 
+		if state == nil {
+			return game.GuessResult{}, temporal.NewApplicationError("the level has not started", "level_not_started")
+		}
 		if finishLevelIfExpired(state, workflow.Now(updateCtx)) {
 			changed.SendAsync(true)
 			return game.GuessResult{Outcome: "timed_out", Game: wordflowLevelView(state)}, nil
@@ -88,6 +178,7 @@ func WordflowLevelWorkflow(ctx workflow.Context, input WordflowLevelWorkflowInpu
 		}
 
 		state.Attempts++
+		state.LastMoveAt = workflow.Now(updateCtx)
 		outcome := "not_in_puzzle"
 		if !canSpell(guess, state.Puzzle.Letters) {
 			outcome = "invalid_letters"
@@ -117,6 +208,9 @@ func WordflowLevelWorkflow(ctx workflow.Context, input WordflowLevelWorkflowInpu
 		}
 		defer lock.Unlock()
 
+		if state == nil {
+			return game.HintResult{}, temporal.NewApplicationError("the level has not started", "level_not_started")
+		}
 		if finishLevelIfExpired(state, workflow.Now(updateCtx)) {
 			changed.SendAsync(true)
 			return game.HintResult{Outcome: "timed_out", Game: wordflowLevelView(state)}, nil
@@ -136,17 +230,11 @@ func WordflowLevelWorkflow(ctx workflow.Context, input WordflowLevelWorkflowInpu
 			if err != nil {
 				return game.HintResult{}, err
 			}
-			updateID := fmt.Sprintf("spend/%s/%s", state.WorkflowID, workflow.GetCurrentUpdateInfo(updateCtx).ID)
-			activityCtx := workflow.WithActivityOptions(updateCtx, workflow.ActivityOptions{StartToCloseTimeout: 30 * time.Second})
 			var spend SpendPointsResult
-			err = workflow.ExecuteActivity(activityCtx, ActivitySpendPoints, SpendPointsActivityInput{
-				PlayerWorkflowID: PlayerWorkflowID(state.PlayerID),
-				UpdateID:         updateID,
-				Spend: SpendPointsInput{
-					LevelWorkflowID: state.WorkflowID,
-					Amount:          price,
-					Reason:          "wordflow/" + string(update.Hint) + "-hint",
-				},
+			err = workflow.ExecuteActivity(workflow.WithActivityOptions(updateCtx, workflow.ActivityOptions{
+				StartToCloseTimeout: 30 * time.Second,
+			}), ActivitySpendPoints, SpendPointsActivityInput{
+				PlayerID: state.PlayerID, LevelWorkflowID: state.WorkflowID, Amount: price,
 			}).Get(updateCtx, &spend)
 			if err != nil {
 				return game.HintResult{}, err
@@ -167,6 +255,7 @@ func WordflowLevelWorkflow(ctx workflow.Context, input WordflowLevelWorkflowInpu
 			return game.HintResult{}, err
 		}
 		recordHintUse(state, update.Hint)
+		state.LastMoveAt = workflow.Now(updateCtx)
 		finishLevelIfSolved(state, workflow.Now(updateCtx))
 		changed.SendAsync(true)
 		return game.HintResult{
@@ -177,8 +266,18 @@ func WordflowLevelWorkflow(ctx workflow.Context, input WordflowLevelWorkflowInpu
 		return campaign.LevelResult{}, err
 	}
 
-	var deadline workflow.Future
-	if !state.Complete && !state.TimedOut {
+	if err := workflow.Await(ctx, func() bool { return state != nil || rejected }); err != nil {
+		return campaign.LevelResult{}, err
+	}
+	if state == nil {
+		return campaign.LevelResult{}, workflow.Await(ctx, func() bool { return workflow.AllHandlersFinished(ctx) })
+	}
+
+	// A timed level ends at its deadline; an untimed one when it has been idle
+	// for untimedLevelIdleLimit. The idle timer is checked when it fires rather
+	// than restarted on every move.
+	var deadline, idle workflow.Future
+	if !levelFinished(state) {
 		if expiresAt := wordflowLevelExpiresAt(state); expiresAt != nil {
 			remaining := expiresAt.Sub(workflow.Now(ctx))
 			if remaining <= 0 {
@@ -189,7 +288,11 @@ func WordflowLevelWorkflow(ctx workflow.Context, input WordflowLevelWorkflowInpu
 		}
 	}
 
-	for !state.Complete && !state.TimedOut {
+	for !levelFinished(state) {
+		if deadline == nil && idle == nil {
+			idleFor := max(lastMoveAt(state).Add(untimedLevelIdleLimit).Sub(workflow.Now(ctx)), time.Second)
+			idle = workflow.NewTimer(ctx, idleFor)
+		}
 		selector := workflow.NewSelector(ctx)
 		selector.AddReceive(changed, func(channel workflow.ReceiveChannel, _ bool) {
 			var ignored bool
@@ -206,8 +309,16 @@ func WordflowLevelWorkflow(ctx workflow.Context, input WordflowLevelWorkflowInpu
 				deadline = nil
 			})
 		}
+		if idle != nil {
+			selector.AddFuture(idle, func(workflow.Future) {
+				idle = nil
+				if !workflow.Now(ctx).Before(lastMoveAt(state).Add(untimedLevelIdleLimit)) {
+					state.Abandoned = true
+				}
+			})
+		}
 		selector.Select(ctx)
-		if shouldContinueWordflowLevel(ctx, continueRequested) {
+		if !levelFinished(state) && shouldContinueWordflowLevel(ctx, continueRequested) {
 			if err := workflow.Await(ctx, func() bool { return workflow.AllHandlersFinished(ctx) }); err != nil {
 				return campaign.LevelResult{}, err
 			}
@@ -221,14 +332,40 @@ func WordflowLevelWorkflow(ctx workflow.Context, input WordflowLevelWorkflowInpu
 		return campaign.LevelResult{}, err
 	}
 
+	result := wordflowLevelResult(state, workflow.Now(ctx))
+	if err := workflow.ExecuteActivity(activityCtx, ActivityRecordLevelResult, RecordLevelResultActivityInput{
+		PlayerID: state.PlayerID, LevelWorkflowID: state.WorkflowID, Result: result,
+	}).Get(ctx, nil); err != nil {
+		return campaign.LevelResult{}, fmt.Errorf("record level result: %w", err)
+	}
+	return result, nil
+}
+
+func levelFinished(state *WordflowLevelState) bool {
+	return state.Complete || state.TimedOut || state.Abandoned
+}
+
+func lastMoveAt(state *WordflowLevelState) time.Time {
+	if state.LastMoveAt.IsZero() {
+		return state.StartedAt
+	}
+	return state.LastMoveAt
+}
+
+func wordflowLevelResult(state *WordflowLevelState, now time.Time) campaign.LevelResult {
 	result := campaign.LevelResult{
 		GameID: campaign.GameWordflow, CampaignID: state.CampaignID,
 		Level: state.Puzzle.Level, Attempts: state.Attempts,
 	}
-	if state.TimedOut {
+	switch {
+	case state.Abandoned:
+		result.CompletedAt = now
+		result.Abandoned = true
+		return result
+	case state.TimedOut:
 		result.CompletedAt = state.TimedOutAt
 		result.TimedOut = true
-		return result, nil
+		return result
 	}
 	result.CompletedAt = state.CompletedAt
 	result.Awards = []campaign.PointAward{{Description: "Wordflow score", Points: state.Score.Points}}
@@ -244,24 +381,7 @@ func WordflowLevelWorkflow(ctx workflow.Context, input WordflowLevelWorkflowInpu
 			Points:      state.Puzzle.SpecialEvent.BonusPoints,
 		})
 	}
-	return result, nil
-}
-
-func initialWordflowLevelState(ctx workflow.Context, input WordflowLevelWorkflowInput) *WordflowLevelState {
-	if input.State != nil {
-		state := input.State
-		if state.StartedAt.IsZero() {
-			state.StartedAt = workflow.Now(ctx)
-		}
-		return state
-	}
-
-	startedAt := input.StartedAt
-	if startedAt.IsZero() {
-		startedAt = workflow.Now(ctx)
-	}
-	return newWordflowLevelState(workflow.GetInfo(ctx).WorkflowExecution.ID,
-		input.PlayerID, input.CampaignID, input.Puzzle, startedAt)
+	return result
 }
 
 func newWordflowLevelState(workflowID, playerID, campaignID string, puzzle game.Puzzle, startedAt time.Time) *WordflowLevelState {

@@ -1,0 +1,62 @@
+# Local stack: a Temporal dev server, DynamoDB Local, the worker and the web app.
+#   docker compose up --build     then open http://localhost:8080 (Temporal UI: http://localhost:8233)
+#   make test                     runs every test, the DynamoDB ones against DynamoDB Local
+# The worker needs OPENAI_API_KEY only to generate the daily challenge and monthly pack;
+# without one, everything else works and generation runs fail.
+x-app-env: &app-env
+  TEMPORAL_ADDRESS: temporal:7233
+  TEMPORAL_NAMESPACE: default
+  WORDFLOW_PLAYERS_TABLE: wordflow-players
+  WORDFLOW_CAMPAIGNS_TABLE: wordflow-campaigns
+  DYNAMODB_ENDPOINT: http://dynamodb:8000
+  # DynamoDB Local accepts any credentials; the SDK needs some to sign with.
+  AWS_REGION: us-west-2
+  AWS_ACCESS_KEY_ID: local
+  AWS_SECRET_ACCESS_KEY: local
+
+services:
+  temporal:
+    image: temporalio/temporal:1.10.1
+    command: ["server", "start-dev", "--ip", "0.0.0.0"]
+    ports: ["7233:7233", "8233:8233"]
+
+  dynamodb:
+    image: amazon/dynamodb-local:3.3.2
+    # One shared, in-memory database whatever the credentials or region.
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports: ["8000:8000"]
+
+  worker:
+    build: {context: ., dockerfile: docker/worker.Dockerfile}
+    environment:
+      <<: *app-env
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-not-set}
+    depends_on: [temporal, dynamodb]
+    restart: on-failure
+
+  web:
+    build: {context: ., dockerfile: docker/web.Dockerfile}
+    environment:
+      <<: *app-env
+      SESSION_JWT_SECRET: local-temporal-wordflow-jwt-secret-change-before-deploying
+    ports: ["8080:8080"]
+    depends_on: [temporal, dynamodb]
+    restart: on-failure
+
+  test:
+    profiles: [test]
+    image: golang:1.26-alpine
+    working_dir: /src
+    volumes: [".:/src", "go-cache:/root/.cache/go-build", "go-mod:/go/pkg/mod"]
+    environment:
+      CGO_ENABLED: "0"
+      WORDFLOW_TEST_DYNAMODB_ENDPOINT: http://dynamodb:8000
+      AWS_REGION: us-west-2
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+    command: ["go", "test", "./..."]
+    depends_on: [dynamodb]
+
+volumes:
+  go-cache:
+  go-mod:

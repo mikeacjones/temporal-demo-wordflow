@@ -38,32 +38,30 @@ type campaignUnlockFile struct {
 	IntervalHours     int `json:"intervalHours"`
 }
 
-func StartDefaultCampaign(ctx context.Context, temporalClient client.Client, taskQueue string) (workflows.CampaignRegistration, error) {
+// StartDefaultCampaign publishes the built-in Temporal Foundations campaign.
+func StartDefaultCampaign(ctx context.Context, temporalClient client.Client, taskQueue string) error {
 	input, err := DefaultWordflowCampaign()
 	if err != nil {
-		return workflows.CampaignRegistration{}, err
+		return err
 	}
 	return StartWordflowCampaign(ctx, temporalClient, taskQueue, input)
 }
 
-func StartWordflowCampaign(ctx context.Context, temporalClient client.Client, taskQueue string, input workflows.WordflowCampaignWorkflowInput) (workflows.CampaignRegistration, error) {
+// StartWordflowCampaign starts the campaign's Workflow, which publishes it to
+// the catalog. A permanent campaign's Workflow completes once it has published,
+// so starting it again (every deploy starts the default one) publishes it again
+// in a new run; the write is idempotent. A run still open is left alone.
+func StartWordflowCampaign(ctx context.Context, temporalClient client.Client, taskQueue string, input workflows.WordflowCampaignWorkflowInput) error {
 	if input.Definition.ID == "" {
-		return workflows.CampaignRegistration{}, fmt.Errorf("campaign ID is required")
+		return fmt.Errorf("campaign ID is required")
 	}
 	_, err := temporalClient.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
 		ID:                       workflows.WordflowCampaignWorkflowID(input.Definition.ID),
 		TaskQueue:                taskQueue,
 		WorkflowIDConflictPolicy: enums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-		WorkflowIDReusePolicy:    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
+		WorkflowIDReusePolicy:    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
 	}, workflows.WordflowCampaignWorkflowName, input)
-	if err != nil {
-		return workflows.CampaignRegistration{}, err
-	}
-	return workflows.CampaignRegistration{
-		WorkflowID: workflows.WordflowCampaignWorkflowID(input.Definition.ID),
-		Definition: input.Definition,
-		Levels:     input.Levels,
-	}, nil
+	return err
 }
 
 func DefaultWordflowCampaign() (workflows.WordflowCampaignWorkflowInput, error) {

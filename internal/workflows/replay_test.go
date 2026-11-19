@@ -8,7 +8,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/sdk/worker"
-	"go.temporal.io/sdk/workflow"
 )
 
 func TestReplayLiveHistories(t *testing.T) {
@@ -23,12 +22,7 @@ func TestReplayLiveHistories(t *testing.T) {
 	sort.Strings(files)
 
 	replayer := worker.NewWorkflowReplayer()
-	replayer.RegisterWorkflowWithOptions(CatalogWorkflow, workflow.RegisterOptions{Name: CatalogWorkflowName})
-	replayer.RegisterWorkflowWithOptions(WordflowCampaignGeneratorWorkflow, workflow.RegisterOptions{Name: WordflowCampaignGeneratorWorkflowName})
-	replayer.RegisterWorkflowWithOptions(WordflowCampaignWorkflow, workflow.RegisterOptions{Name: WordflowCampaignWorkflowName})
-	replayer.RegisterWorkflowWithOptions(PlayerWorkflow, workflow.RegisterOptions{Name: PlayerWorkflowName})
-	replayer.RegisterWorkflowWithOptions(WordflowLevelWorkflow, workflow.RegisterOptions{Name: WordflowLevelWorkflowName})
-	replayer.RegisterWorkflowWithOptions(LeaderboardWorkflow, workflow.RegisterOptions{Name: LeaderboardWorkflowName})
+	Register(replayer, false)
 
 	for _, file := range files {
 		file := file

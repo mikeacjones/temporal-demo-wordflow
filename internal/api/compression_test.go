@@ -2,16 +2,12 @@ package api
 
 import (
 	"compress/gzip"
-	"context"
-	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/aws/aws-lambda-go/events"
-	"github.com/awslabs/aws-lambda-go-api-proxy/httpadapter"
 	"github.com/stretchr/testify/require"
 )
 
@@ -82,7 +78,7 @@ func TestCompressionSkipsResponsesThatWouldNotBenefit(t *testing.T) {
 }
 
 func TestEmbeddedWebAssetsUseCompression(t *testing.T) {
-	handler := New(nil, "test-task-queue", "default", "a-test-session-secret-with-at-least-32-characters")
+	handler := New(nil, newMemoryStore(), "test-task-queue", "default", "a-test-session-secret-with-at-least-32-characters")
 
 	for _, path := range []string{"/", "/app.js", "/styles.css", "/workflows/", "/workflows/app.js"} {
 		t.Run(path, func(t *testing.T) {
@@ -117,7 +113,7 @@ func TestCompressionPreservesOtherVaryFields(t *testing.T) {
 }
 
 func TestEmbeddedPNGStaysUncompressed(t *testing.T) {
-	handler := New(nil, "test-task-queue", "default", "a-test-session-secret-with-at-least-32-characters")
+	handler := New(nil, newMemoryStore(), "test-task-queue", "default", "a-test-session-secret-with-at-least-32-characters")
 	request := httptest.NewRequest(http.MethodGet, "/social-preview.png", nil)
 	request.Header.Set("Accept-Encoding", "gzip")
 	response := httptest.NewRecorder()
@@ -128,31 +124,6 @@ func TestEmbeddedPNGStaysUncompressed(t *testing.T) {
 	require.Equal(t, "image/png", response.Header().Get("Content-Type"))
 	require.Empty(t, response.Header().Get("Content-Encoding"))
 }
-
-func TestLambdaHTTPAPIAdapterCarriesCompressedResponses(t *testing.T) {
-	handler := New(nil, "test-task-queue", "default", "a-test-session-secret-with-at-least-32-characters")
-	adapter := httpadapter.NewV2(handler)
-
-	response, err := adapter.ProxyWithContext(context.Background(), events.APIGatewayV2HTTPRequest{
-		Headers: map[string]string{"accept-encoding": "gzip, br"},
-		RequestContext: events.APIGatewayV2HTTPRequestContext{
-			DomainName: "example.execute-api.us-west-2.amazonaws.com",
-			HTTP: events.APIGatewayV2HTTPRequestContextHTTPDescription{
-				Method: http.MethodGet,
-				Path:   "/app.js",
-			},
-		},
-	})
-
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, response.StatusCode)
-	require.Equal(t, "gzip", response.Headers["Content-Encoding"])
-	require.True(t, response.IsBase64Encoded)
-	compressed, err := base64.StdEncoding.DecodeString(response.Body)
-	require.NoError(t, err)
-	require.Contains(t, gunzip(t, compressed), "crypto.randomUUID")
-}
-
 func gunzip(t *testing.T, compressed []byte) string {
 	t.Helper()
 	reader, err := gzip.NewReader(strings.NewReader(string(compressed)))
