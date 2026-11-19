@@ -17,6 +17,10 @@ const (
 
 	dailyChallengeHistory = 10
 	monthlyPackHistory    = 3
+
+	// A run has to finish inside its Schedule's 30-minute execution timeout.
+	dailyChallengeMaxTurns = 30
+	monthlyPackMaxTurns    = 40
 )
 
 // CampaignGeneratorWorkflowInput selects which kind of campaign one run creates.
@@ -37,12 +41,66 @@ type CampaignGeneratorResult struct {
 	Recent []GeneratedCampaign `json:"recent"`
 }
 
-type GenerateWordflowCampaignActivityInput struct {
+// CampaignRequest describes the campaign one generator run is asked to create.
+type CampaignRequest struct {
 	Kind          campaign.Kind `json:"kind"`
 	Date          string        `json:"date"`
 	StartsAt      time.Time     `json:"startsAt"`
 	EndsAt        *time.Time    `json:"endsAt,omitempty"`
 	ExcludedWords []string      `json:"excludedWords,omitempty"`
+}
+
+// The tools the generating agent can call. Submitting is the only way to finish.
+const (
+	AgentToolCheckWords     = "check_words"
+	AgentToolCheckLevel     = "check_level"
+	AgentToolSubmitCampaign = "submit_campaign"
+)
+
+type AgentItemType string
+
+const (
+	AgentItemMessage    AgentItemType = "message"
+	AgentItemToolCall   AgentItemType = "tool_call"
+	AgentItemToolResult AgentItemType = "tool_result"
+)
+
+// AgentItem is one entry of the conversation after the opening prompt. The
+// Workflow owns the conversation, so every turn and tool call is in its history.
+type AgentItem struct {
+	Type      AgentItemType `json:"type"`
+	Text      string        `json:"text,omitempty"`      // message text or tool output
+	CallID    string        `json:"callId,omitempty"`    // tool call and result
+	Name      string        `json:"name,omitempty"`      // tool call
+	Arguments string        `json:"arguments,omitempty"` // tool call
+}
+
+type AgentToolCall struct {
+	CallID    string `json:"callId"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type RunCampaignAgentTurnInput struct {
+	Request CampaignRequest `json:"request"`
+	Items   []AgentItem     `json:"items,omitempty"`
+}
+
+type RunCampaignAgentTurnResult struct {
+	Calls []AgentToolCall `json:"calls,omitempty"`
+}
+
+type ExecuteCampaignToolInput struct {
+	Request CampaignRequest `json:"request"`
+	Call    AgentToolCall   `json:"call"`
+}
+
+// ExecuteCampaignToolResult always carries an Output for the agent, including
+// when a check or submission is rejected. Campaign is set only when a
+// submission passed full validation.
+type ExecuteCampaignToolResult struct {
+	Output   string                         `json:"output"`
+	Campaign *WordflowCampaignWorkflowInput `json:"campaign,omitempty"`
 }
 
 // GeneratedCampaignID names the campaign a run of this kind creates for the
@@ -54,11 +112,14 @@ func GeneratedCampaignID(kind campaign.Kind, date string) string {
 	return string(kind) + "-" + date
 }
 
-// WordflowCampaignGeneratorWorkflow generates one campaign with an Activity
-// and starts it. Daily challenges are single-day campaigns; monthly packs are
-// permanent campaigns that add new levels to the catalog.
+// WordflowCampaignGeneratorWorkflow runs an agent loop that designs one
+// campaign, then starts it. Each model turn and each tool call is an Activity.
+// A rejected check or submission goes back to the agent as a tool result, not as
+// a failure; the run fails only when the agent uses up its turns. Daily
+// challenges are single-day campaigns; monthly packs are permanent campaigns
+// that add new levels to the catalog.
 func WordflowCampaignGeneratorWorkflow(ctx workflow.Context, input CampaignGeneratorWorkflowInput) (CampaignGeneratorResult, error) {
-	date, startsAt, endsAt, history, err := generatedCampaignPeriod(input.Kind, workflow.Now(ctx))
+	period, err := generatedCampaignPeriod(input.Kind, workflow.Now(ctx))
 	if err != nil {
 		return CampaignGeneratorResult{}, temporal.NewNonRetryableApplicationError(err.Error(), "invalid_campaign_kind", err)
 	}
@@ -70,25 +131,16 @@ func WordflowCampaignGeneratorWorkflow(ctx workflow.Context, input CampaignGener
 		}
 	}
 
-	activityCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-		StartToCloseTimeout:    90 * time.Second,
-		ScheduleToCloseTimeout: 10 * time.Minute,
-		RetryPolicy: &temporal.RetryPolicy{
-			InitialInterval:    5 * time.Second,
-			BackoffCoefficient: 2,
-			MaximumInterval:    time.Minute,
-			MaximumAttempts:    5,
-		},
-	})
-	var campaignInput WordflowCampaignWorkflowInput
-	if err := workflow.ExecuteActivity(activityCtx, ActivityGenerateWordflowCampaign, GenerateWordflowCampaignActivityInput{
-		Kind: input.Kind, Date: date, StartsAt: startsAt, EndsAt: endsAt,
+	request := CampaignRequest{
+		Kind: input.Kind, Date: period.date, StartsAt: period.startsAt, EndsAt: period.endsAt,
 		ExcludedWords: recentAnswers(previous.Recent),
-	}).Get(ctx, &campaignInput); err != nil {
-		return CampaignGeneratorResult{}, fmt.Errorf("generate %s campaign: %w", input.Kind, err)
+	}
+	campaignInput, err := runCampaignAgent(ctx, request, period.maxTurns)
+	if err != nil {
+		return CampaignGeneratorResult{}, err
 	}
 
-	expectedCampaignID := GeneratedCampaignID(input.Kind, date)
+	expectedCampaignID := GeneratedCampaignID(input.Kind, period.date)
 	if campaignInput.Definition.ID != expectedCampaignID {
 		return CampaignGeneratorResult{}, temporal.NewNonRetryableApplicationError(
 			fmt.Sprintf("generated campaign ID %q does not match %q", campaignInput.Definition.ID, expectedCampaignID),
@@ -107,24 +159,95 @@ func WordflowCampaignGeneratorWorkflow(ctx workflow.Context, input CampaignGener
 		return CampaignGeneratorResult{}, fmt.Errorf("start %s campaign: %w", input.Kind, err)
 	}
 
-	return CampaignGeneratorResult{Recent: appendGenerated(previous.Recent, campaignInput, history)}, nil
+	return CampaignGeneratorResult{Recent: appendGenerated(previous.Recent, campaignInput, period.history)}, nil
 }
 
-// generatedCampaignPeriod returns the Toronto-time period that now falls in,
-// and how many past campaigns of this kind later runs avoid repeating.
-// A nil end means the campaign never expires.
-func generatedCampaignPeriod(kind campaign.Kind, now time.Time) (date string, startsAt time.Time, endsAt *time.Time, history int, err error) {
+// runCampaignAgent loops model turns and tool calls until the agent submits a
+// campaign that passes full validation, or maxTurns turns have been used.
+func runCampaignAgent(ctx workflow.Context, request CampaignRequest, maxTurns int) (WordflowCampaignWorkflowInput, error) {
+	modelCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 2 * time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval:    5 * time.Second,
+			BackoffCoefficient: 2,
+			MaximumInterval:    time.Minute,
+			MaximumAttempts:    5,
+		},
+	})
+	toolCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: time.Minute,
+		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 3},
+	})
+	logger := workflow.GetLogger(ctx)
+
+	var items []AgentItem
+	lastRejection := "the agent never submitted a campaign"
+	for turn := 1; turn <= maxTurns; turn++ {
+		var turnResult RunCampaignAgentTurnResult
+		if err := workflow.ExecuteActivity(modelCtx, ActivityRunCampaignAgentTurn, RunCampaignAgentTurnInput{
+			Request: request, Items: items,
+		}).Get(ctx, &turnResult); err != nil {
+			return WordflowCampaignWorkflowInput{}, fmt.Errorf("%s agent turn %d: %w", request.Kind, turn, err)
+		}
+		if len(turnResult.Calls) == 0 {
+			items = append(items, AgentItem{Type: AgentItemMessage, Text: "Respond only by calling a tool. Finish by calling " + AgentToolSubmitCampaign + "."})
+			continue
+		}
+
+		results := make([]workflow.Future, len(turnResult.Calls))
+		for index, call := range turnResult.Calls {
+			results[index] = workflow.ExecuteActivity(toolCtx, ActivityExecuteCampaignTool, ExecuteCampaignToolInput{Request: request, Call: call})
+		}
+		var accepted *WordflowCampaignWorkflowInput
+		for index, call := range turnResult.Calls {
+			var result ExecuteCampaignToolResult
+			if err := results[index].Get(ctx, &result); err != nil {
+				return WordflowCampaignWorkflowInput{}, fmt.Errorf("%s tool %s: %w", request.Kind, call.Name, err)
+			}
+			items = append(items,
+				AgentItem{Type: AgentItemToolCall, CallID: call.CallID, Name: call.Name, Arguments: call.Arguments},
+				AgentItem{Type: AgentItemToolResult, CallID: call.CallID, Text: result.Output},
+			)
+			switch {
+			case result.Campaign != nil && accepted == nil:
+				accepted = result.Campaign
+			case call.Name == AgentToolSubmitCampaign && result.Campaign == nil:
+				lastRejection = result.Output
+				logger.Info("Campaign submission rejected", "kind", request.Kind, "turn", turn, "reason", result.Output)
+			}
+		}
+		if accepted != nil {
+			return *accepted, nil
+		}
+	}
+	return WordflowCampaignWorkflowInput{}, temporal.NewNonRetryableApplicationError(
+		fmt.Sprintf("the agent did not submit a valid %s campaign in %d turns; last rejection: %s", request.Kind, maxTurns, lastRejection),
+		"campaign_not_generated",
+		nil,
+	)
+}
+
+type campaignPeriod struct {
+	date     string
+	startsAt time.Time
+	endsAt   *time.Time // nil: the campaign never expires
+	history  int        // past campaigns of this kind that later runs avoid repeating
+	maxTurns int        // model turns the agent gets
+}
+
+// generatedCampaignPeriod returns the Toronto-time period that now falls in.
+func generatedCampaignPeriod(kind campaign.Kind, now time.Time) (campaignPeriod, error) {
 	local := now.In(torontoLocation)
 	switch kind {
 	case campaign.KindDailyChallenge:
-		startsAt = time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, torontoLocation)
-		end := startsAt.AddDate(0, 0, 1)
-		return startsAt.Format(dateLayout), startsAt, &end, dailyChallengeHistory, nil
+		startsAt := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, torontoLocation)
+		endsAt := startsAt.AddDate(0, 0, 1)
+		return campaignPeriod{date: startsAt.Format(dateLayout), startsAt: startsAt, endsAt: &endsAt, history: dailyChallengeHistory, maxTurns: dailyChallengeMaxTurns}, nil
 	case campaign.KindMonthlyPack:
-		startsAt = time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, torontoLocation)
-		return startsAt.Format(dateLayout), startsAt, nil, monthlyPackHistory, nil
+		startsAt := time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, torontoLocation)
+		return campaignPeriod{date: startsAt.Format(dateLayout), startsAt: startsAt, history: monthlyPackHistory, maxTurns: monthlyPackMaxTurns}, nil
 	default:
-		return "", time.Time{}, nil, 0, fmt.Errorf("unsupported campaign kind %q", kind)
+		return campaignPeriod{}, fmt.Errorf("unsupported campaign kind %q", kind)
 	}
 }
 

@@ -9,17 +9,12 @@ import (
 	"github.com/mjones/temporal-word-game/internal/campaign"
 	"github.com/mjones/temporal-word-game/internal/game"
 
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/workflow"
 )
-
-func testGenerateWordflowCampaign(context.Context, GenerateWordflowCampaignActivityInput) (WordflowCampaignWorkflowInput, error) {
-	return WordflowCampaignWorkflowInput{}, nil
-}
 
 func generatedCampaignFixture(id string, answer string) WordflowCampaignWorkflowInput {
 	return WordflowCampaignWorkflowInput{
@@ -42,47 +37,80 @@ func previousGeneratedCampaigns(count int) CampaignGeneratorResult {
 	return result
 }
 
-type generatorRun struct {
-	env             *testsuite.TestWorkflowEnvironment
-	activityInput   GenerateWordflowCampaignActivityInput
+func toolCall(id, name string) AgentToolCall {
+	return AgentToolCall{CallID: id, Name: name, Arguments: `{"call":"` + id + `"}`}
+}
+
+// agentRun scripts the model's turns and the tools' answers, and records what
+// the Workflow sent to each.
+type agentRun struct {
+	env *testsuite.TestWorkflowEnvironment
+	// turns[n] is what the model does on turn n+1. A turn past the script repeats the last one.
+	turns []RunCampaignAgentTurnResult
+	// toolResult answers a call; the default accepts a submission with accepted.
+	toolResult func(AgentToolCall) ExecuteCampaignToolResult
+
+	requests        []CampaignRequest
+	turnInputs      []RunCampaignAgentTurnInput
+	executed        []AgentToolCall
 	startedCampaign WordflowCampaignWorkflowInput
 }
 
-func runGenerator(t *testing.T, now time.Time, kind campaign.Kind, previous CampaignGeneratorResult, generated WordflowCampaignWorkflowInput) *generatorRun {
-	t.Helper()
-	run := &generatorRun{env: (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()}
+func newAgentRun(now time.Time, previous CampaignGeneratorResult) *agentRun {
+	run := &agentRun{env: (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()}
 	run.env.SetStartTime(now)
 	if len(previous.Recent) > 0 {
 		run.env.SetLastCompletionResult(previous)
 	}
-	run.env.RegisterActivityWithOptions(testGenerateWordflowCampaign, activity.RegisterOptions{Name: ActivityGenerateWordflowCampaign})
-	run.env.OnActivity(ActivityGenerateWordflowCampaign, mock.Anything, mock.Anything).
-		Run(func(arguments mock.Arguments) {
-			run.activityInput = arguments.Get(1).(GenerateWordflowCampaignActivityInput)
-		}).Return(generated, nil).Once()
+	run.env.RegisterActivityWithOptions(func(_ context.Context, input RunCampaignAgentTurnInput) (RunCampaignAgentTurnResult, error) {
+		run.turnInputs = append(run.turnInputs, input)
+		turn := min(len(run.turnInputs), len(run.turns)) - 1
+		return run.turns[turn], nil
+	}, activity.RegisterOptions{Name: ActivityRunCampaignAgentTurn})
+	run.env.RegisterActivityWithOptions(func(_ context.Context, input ExecuteCampaignToolInput) (ExecuteCampaignToolResult, error) {
+		run.requests = append(run.requests, input.Request)
+		run.executed = append(run.executed, input.Call)
+		return run.toolResult(input.Call), nil
+	}, activity.RegisterOptions{Name: ActivityExecuteCampaignTool})
 	run.env.RegisterWorkflowWithOptions(func(_ workflow.Context, input WordflowCampaignWorkflowInput) error {
 		run.startedCampaign = input
 		return nil
 	}, workflow.RegisterOptions{Name: WordflowCampaignWorkflowName})
-
-	run.env.ExecuteWorkflow(WordflowCampaignGeneratorWorkflow, CampaignGeneratorWorkflowInput{Kind: kind})
 	return run
+}
+
+func (run *agentRun) execute(kind campaign.Kind) {
+	run.env.ExecuteWorkflow(WordflowCampaignGeneratorWorkflow, CampaignGeneratorWorkflowInput{Kind: kind})
+}
+
+// acceptSubmission makes every submit_campaign call succeed with generated.
+func acceptSubmission(generated WordflowCampaignWorkflowInput) func(AgentToolCall) ExecuteCampaignToolResult {
+	return func(call AgentToolCall) ExecuteCampaignToolResult {
+		if call.Name == AgentToolSubmitCampaign {
+			return ExecuteCampaignToolResult{Output: `{"accepted":true}`, Campaign: &generated}
+		}
+		return ExecuteCampaignToolResult{Output: `{"ok":true}`}
+	}
 }
 
 func TestDailyGeneratorStartsTodaysChallengeAndHandsOnTenDaysOfAnswers(t *testing.T) {
 	generated := generatedCampaignFixture("daily-challenge-2026-09-22", "NEWWORD")
-	run := runGenerator(t, time.Date(2026, 9, 22, 0, 0, 5, 0, torontoLocation),
-		campaign.KindDailyChallenge, previousGeneratedCampaigns(dailyChallengeHistory), generated)
+	run := newAgentRun(time.Date(2026, 9, 22, 0, 0, 5, 0, torontoLocation), previousGeneratedCampaigns(dailyChallengeHistory))
+	run.turns = []RunCampaignAgentTurnResult{{Calls: []AgentToolCall{toolCall("submit-1", AgentToolSubmitCampaign)}}}
+	run.toolResult = acceptSubmission(generated)
+
+	run.execute(campaign.KindDailyChallenge)
 
 	require.NoError(t, run.env.GetWorkflowError())
 	startsAt := time.Date(2026, 9, 22, 0, 0, 0, 0, torontoLocation)
 	endsAt := startsAt.AddDate(0, 0, 1)
-	require.Equal(t, campaign.KindDailyChallenge, run.activityInput.Kind)
-	require.Equal(t, "2026-09-22", run.activityInput.Date)
-	require.True(t, startsAt.Equal(run.activityInput.StartsAt))
-	require.True(t, endsAt.Equal(*run.activityInput.EndsAt))
-	require.Len(t, run.activityInput.ExcludedWords, dailyChallengeHistory)
-	require.Equal(t, "OLDWORD0", run.activityInput.ExcludedWords[0])
+	request := run.turnInputs[0].Request
+	require.Equal(t, campaign.KindDailyChallenge, request.Kind)
+	require.Equal(t, "2026-09-22", request.Date)
+	require.True(t, startsAt.Equal(request.StartsAt))
+	require.True(t, endsAt.Equal(*request.EndsAt))
+	require.Len(t, request.ExcludedWords, dailyChallengeHistory)
+	require.Equal(t, "OLDWORD0", request.ExcludedWords[0])
 	require.Equal(t, generated, run.startedCampaign)
 
 	var result CampaignGeneratorResult
@@ -92,15 +120,98 @@ func TestDailyGeneratorStartsTodaysChallengeAndHandsOnTenDaysOfAnswers(t *testin
 	require.Equal(t, GeneratedCampaign{CampaignID: "daily-challenge-2026-09-22", Answers: []string{"NEWWORD"}}, result.Recent[9])
 }
 
-func TestMonthlyGeneratorStartsAPermanentPackForTheCurrentMonth(t *testing.T) {
-	generated := generatedCampaignFixture("monthly-pack-2026-12", "NEWWORD")
-	run := runGenerator(t, time.Date(2026, 12, 14, 9, 0, 0, 0, torontoLocation),
-		campaign.KindMonthlyPack, previousGeneratedCampaigns(monthlyPackHistory), generated)
+func TestAgentChecksAndResubmitsAfterARejectionWithoutFailing(t *testing.T) {
+	generated := generatedCampaignFixture("daily-challenge-2026-09-22", "NEWWORD")
+	run := newAgentRun(time.Date(2026, 9, 22, 12, 0, 0, 0, torontoLocation), CampaignGeneratorResult{})
+	run.turns = []RunCampaignAgentTurnResult{
+		{Calls: []AgentToolCall{toolCall("words-1", AgentToolCheckWords), toolCall("level-1", AgentToolCheckLevel)}},
+		{Calls: []AgentToolCall{toolCall("submit-1", AgentToolSubmitCampaign)}},
+		{Calls: []AgentToolCall{toolCall("submit-2", AgentToolSubmitCampaign)}},
+	}
+	run.toolResult = func(call AgentToolCall) ExecuteCampaignToolResult {
+		if call.CallID == "submit-1" {
+			return ExecuteCampaignToolResult{Output: `{"accepted":false,"error":"level 3 pads its answers"}`}
+		}
+		return acceptSubmission(generated)(call)
+	}
+
+	run.execute(campaign.KindDailyChallenge)
 
 	require.NoError(t, run.env.GetWorkflowError())
-	require.Equal(t, "2026-12-01", run.activityInput.Date)
-	require.True(t, time.Date(2026, 12, 1, 0, 0, 0, 0, torontoLocation).Equal(run.activityInput.StartsAt))
-	require.Nil(t, run.activityInput.EndsAt)
+	require.Len(t, run.turnInputs, 3)
+	require.Equal(t, generated, run.startedCampaign)
+	require.Len(t, run.executed, 4, "both parallel checks and both submissions ran")
+
+	require.Empty(t, run.turnInputs[0].Items)
+	secondTurn := run.turnInputs[1].Items
+	require.Equal(t, []AgentItem{
+		{Type: AgentItemToolCall, CallID: "words-1", Name: AgentToolCheckWords, Arguments: `{"call":"words-1"}`},
+		{Type: AgentItemToolResult, CallID: "words-1", Text: `{"ok":true}`},
+		{Type: AgentItemToolCall, CallID: "level-1", Name: AgentToolCheckLevel, Arguments: `{"call":"level-1"}`},
+		{Type: AgentItemToolResult, CallID: "level-1", Text: `{"ok":true}`},
+	}, secondTurn)
+	thirdTurn := run.turnInputs[2].Items
+	require.Len(t, thirdTurn, 6)
+	require.Equal(t, `{"accepted":false,"error":"level 3 pads its answers"}`, thirdTurn[5].Text,
+		"the agent sees why its submission was rejected")
+}
+
+func TestAgentThatNeverSubmitsAValidCampaignFailsAfterItsTurnBudget(t *testing.T) {
+	for _, test := range []struct {
+		kind     campaign.Kind
+		maxTurns int
+	}{
+		{campaign.KindDailyChallenge, dailyChallengeMaxTurns},
+		{campaign.KindMonthlyPack, monthlyPackMaxTurns},
+	} {
+		t.Run(string(test.kind), func(t *testing.T) {
+			run := newAgentRun(time.Date(2026, 9, 22, 12, 0, 0, 0, torontoLocation), CampaignGeneratorResult{})
+			run.turns = []RunCampaignAgentTurnResult{{Calls: []AgentToolCall{toolCall("submit", AgentToolSubmitCampaign)}}}
+			run.toolResult = func(AgentToolCall) ExecuteCampaignToolResult {
+				return ExecuteCampaignToolResult{Output: `{"accepted":false,"error":"no answer uses all 8 letters"}`}
+			}
+
+			run.execute(test.kind)
+
+			var applicationError *temporal.ApplicationError
+			require.ErrorAs(t, run.env.GetWorkflowError(), &applicationError)
+			require.Equal(t, "campaign_not_generated", applicationError.Type())
+			require.True(t, applicationError.NonRetryable())
+			require.ErrorContains(t, applicationError, "no answer uses all 8 letters")
+			require.Len(t, run.turnInputs, test.maxTurns)
+			require.Empty(t, run.startedCampaign.Definition.ID)
+		})
+	}
+}
+
+func TestAgentTurnWithoutToolCallsIsToldToCallATool(t *testing.T) {
+	generated := generatedCampaignFixture("daily-challenge-2026-09-22", "NEWWORD")
+	run := newAgentRun(time.Date(2026, 9, 22, 12, 0, 0, 0, torontoLocation), CampaignGeneratorResult{})
+	run.turns = []RunCampaignAgentTurnResult{{}, {Calls: []AgentToolCall{toolCall("submit-1", AgentToolSubmitCampaign)}}}
+	run.toolResult = acceptSubmission(generated)
+
+	run.execute(campaign.KindDailyChallenge)
+
+	require.NoError(t, run.env.GetWorkflowError())
+	require.Len(t, run.turnInputs[1].Items, 1)
+	nudge := run.turnInputs[1].Items[0]
+	require.Equal(t, AgentItemMessage, nudge.Type)
+	require.Contains(t, nudge.Text, AgentToolSubmitCampaign)
+}
+
+func TestMonthlyGeneratorStartsAPermanentPackForTheCurrentMonth(t *testing.T) {
+	generated := generatedCampaignFixture("monthly-pack-2026-12", "NEWWORD")
+	run := newAgentRun(time.Date(2026, 12, 14, 9, 0, 0, 0, torontoLocation), previousGeneratedCampaigns(monthlyPackHistory))
+	run.turns = []RunCampaignAgentTurnResult{{Calls: []AgentToolCall{toolCall("submit-1", AgentToolSubmitCampaign)}}}
+	run.toolResult = acceptSubmission(generated)
+
+	run.execute(campaign.KindMonthlyPack)
+
+	require.NoError(t, run.env.GetWorkflowError())
+	request := run.turnInputs[0].Request
+	require.Equal(t, "2026-12-01", request.Date)
+	require.True(t, time.Date(2026, 12, 1, 0, 0, 0, 0, torontoLocation).Equal(request.StartsAt))
+	require.Nil(t, request.EndsAt)
 	require.Equal(t, generated, run.startedCampaign)
 
 	var result CampaignGeneratorResult
@@ -111,16 +222,22 @@ func TestMonthlyGeneratorStartsAPermanentPackForTheCurrentMonth(t *testing.T) {
 }
 
 func TestGeneratorWithoutAPreviousRunExcludesNothing(t *testing.T) {
-	run := runGenerator(t, time.Date(2026, 9, 22, 12, 0, 0, 0, torontoLocation),
-		campaign.KindDailyChallenge, CampaignGeneratorResult{}, generatedCampaignFixture("daily-challenge-2026-09-22", "NEWWORD"))
+	run := newAgentRun(time.Date(2026, 9, 22, 12, 0, 0, 0, torontoLocation), CampaignGeneratorResult{})
+	run.turns = []RunCampaignAgentTurnResult{{Calls: []AgentToolCall{toolCall("submit-1", AgentToolSubmitCampaign)}}}
+	run.toolResult = acceptSubmission(generatedCampaignFixture("daily-challenge-2026-09-22", "NEWWORD"))
+
+	run.execute(campaign.KindDailyChallenge)
 
 	require.NoError(t, run.env.GetWorkflowError())
-	require.Empty(t, run.activityInput.ExcludedWords)
+	require.Empty(t, run.turnInputs[0].Request.ExcludedWords)
 }
 
 func TestGeneratorRejectsACampaignForTheWrongPeriod(t *testing.T) {
-	run := runGenerator(t, time.Date(2026, 9, 22, 12, 0, 0, 0, torontoLocation),
-		campaign.KindDailyChallenge, CampaignGeneratorResult{}, generatedCampaignFixture("daily-challenge-2026-09-21", "NEWWORD"))
+	run := newAgentRun(time.Date(2026, 9, 22, 12, 0, 0, 0, torontoLocation), CampaignGeneratorResult{})
+	run.turns = []RunCampaignAgentTurnResult{{Calls: []AgentToolCall{toolCall("submit-1", AgentToolSubmitCampaign)}}}
+	run.toolResult = acceptSubmission(generatedCampaignFixture("daily-challenge-2026-09-21", "NEWWORD"))
+
+	run.execute(campaign.KindDailyChallenge)
 
 	var applicationError *temporal.ApplicationError
 	require.ErrorAs(t, run.env.GetWorkflowError(), &applicationError)
@@ -129,28 +246,32 @@ func TestGeneratorRejectsACampaignForTheWrongPeriod(t *testing.T) {
 	require.Empty(t, run.startedCampaign.Definition.ID)
 }
 
-func TestGeneratorRejectsAnUnknownKindWithoutGenerating(t *testing.T) {
-	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
+func TestGeneratorRejectsAnUnknownKindWithoutAskingTheModel(t *testing.T) {
+	run := newAgentRun(time.Date(2026, 9, 22, 12, 0, 0, 0, torontoLocation), CampaignGeneratorResult{})
 
-	env.ExecuteWorkflow(WordflowCampaignGeneratorWorkflow, CampaignGeneratorWorkflowInput{Kind: "weekly"})
+	run.execute("weekly")
 
 	var applicationError *temporal.ApplicationError
-	require.ErrorAs(t, env.GetWorkflowError(), &applicationError)
+	require.ErrorAs(t, run.env.GetWorkflowError(), &applicationError)
 	require.Equal(t, "invalid_campaign_kind", applicationError.Type())
 	require.True(t, applicationError.NonRetryable())
+	require.Empty(t, run.turnInputs)
 }
 
 func TestGeneratedCampaignPeriodUsesTorontoCalendarDays(t *testing.T) {
 	// 02:00 UTC on September 22 is still the evening of September 21 in Toronto.
-	date, startsAt, endsAt, _, err := generatedCampaignPeriod(campaign.KindDailyChallenge, time.Date(2026, 9, 22, 2, 0, 0, 0, time.UTC))
+	period, err := generatedCampaignPeriod(campaign.KindDailyChallenge, time.Date(2026, 9, 22, 2, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
-	require.Equal(t, "2026-09-21", date)
-	require.True(t, time.Date(2026, 9, 21, 0, 0, 0, 0, torontoLocation).Equal(startsAt))
-	require.True(t, startsAt.AddDate(0, 0, 1).Equal(*endsAt))
+	require.Equal(t, "2026-09-21", period.date)
+	require.True(t, time.Date(2026, 9, 21, 0, 0, 0, 0, torontoLocation).Equal(period.startsAt))
+	require.True(t, period.startsAt.AddDate(0, 0, 1).Equal(*period.endsAt))
+	require.Equal(t, dailyChallengeMaxTurns, period.maxTurns)
 
-	date, _, _, _, err = generatedCampaignPeriod(campaign.KindMonthlyPack, time.Date(2026, 12, 1, 3, 0, 0, 0, time.UTC))
+	period, err = generatedCampaignPeriod(campaign.KindMonthlyPack, time.Date(2026, 12, 1, 3, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
-	require.Equal(t, "2026-11-01", date, "03:00 UTC on December 1 is still November 30 in Toronto")
+	require.Equal(t, "2026-11-01", period.date, "03:00 UTC on December 1 is still November 30 in Toronto")
+	require.Nil(t, period.endsAt)
+	require.Equal(t, monthlyPackMaxTurns, period.maxTurns)
 }
 
 func TestGeneratedCampaignID(t *testing.T) {

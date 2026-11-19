@@ -22,7 +22,7 @@ on first registration and used by the leaderboard.
 | Component | Owns | Lifetime |
 | --- | --- | --- |
 | `CatalogWorkflow` | Immutable campaign snapshots used to render campaign cards and authorize level starts | Singleton entity; Continue-As-New keeps history bounded |
-| `WordflowCampaignGeneratorWorkflow` | Generates one campaign (a daily challenge or a monthly pack) through OpenAI tool calls and starts it | One short run per Schedule fire; the Schedule hands each run the previous run's answers as its last completion result |
+| `WordflowCampaignGeneratorWorkflow` | Runs an OpenAI agent loop that designs and checks one campaign (a daily challenge or a monthly pack), then starts it | One run per Schedule fire; the Schedule hands each run the previous run's answers as its last completion result |
 | `WordflowCampaignWorkflow` | One campaign's levels, unlock schedule, prerequisites, availability dates, and expiration timer | Permanent campaigns stay open; time-bounded campaigns complete at expiration |
 | `PlayerWorkflow` | Password hash, display name, campaign progress, points, rewards, streaks, and the active level reference | Long-lived entity; Continue-As-New keeps history bounded |
 | `WordflowLevelWorkflow` | One player's level answers, guesses, revealed cells, hints, timing, scoring, and completion | Runs until the level is solved or its hard limit expires; can Continue-As-New after heavy use |
@@ -50,14 +50,25 @@ in the Temporal UI survives a restart.
 | `wordflow-daily-challenge` | Every day at midnight | `daily-challenge-YYYY-MM-DD`: three hard levels, one attempt, 180-second limit, closes at the next midnight |
 | `wordflow-monthly-pack` | Midnight on the 1st | `monthly-pack-YYYY-MM`: nine levels on one theme, no time limit, permanent |
 
-Each fire starts `WordflowCampaignGeneratorWorkflow` with the campaign kind.
-It asks OpenAI to finish its turn by calling one strict `create_wordflow_campaign`
-tool, which supplies only the description and creative level content. The
-Activity validates the letter multisets, answer uniqueness, full-queue words, and
-connected crossword layouts, then applies the kind's fixed rules in code. The
-Workflow starts the campaign as an abandoned child and returns the recent
-answers (ten days of daily challenges, three monthly packs). Temporal passes
-that result to the Schedule's next run, which rejects any answer already used.
+Each fire starts `WordflowCampaignGeneratorWorkflow` with the campaign kind. It
+runs an agent loop in which every model turn and every tool call is an Activity,
+so the Temporal UI shows the whole conversation. The model has three tools:
+
+| Tool | Does |
+| --- | --- |
+| `check_words` | Checks one level's letter bank and ten answers: letters, spelling, repeats, padding, answers used recently |
+| `check_level` | Does that and also builds the crossword layout, to confirm the answers connect |
+| `submit_campaign` | Submits the whole campaign for final validation; a pass ends the loop |
+
+The model must call a tool on every turn and chooses when to check. A rejected
+check or submission goes back to the model as the tool's result, not as a
+failure, and the model corrects it and tries again. The run fails only when the
+model uses its turn budget (30 for a daily challenge, 40 for a monthly pack)
+without a valid submission. The Workflow logs each rejected submission and its
+reason. An accepted campaign starts as an abandoned child, and the Workflow
+returns the recent answers (ten days of daily challenges, three monthly packs).
+Temporal passes that result to the Schedule's next run, which rejects any answer
+already used.
 Both Schedules skip a run that overlaps a still-running one.
 
 To start a level, the Player runs a short Activity that asks the Catalog to

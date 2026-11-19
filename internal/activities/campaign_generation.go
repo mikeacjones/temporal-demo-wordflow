@@ -1,10 +1,7 @@
 package activities
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 	"unicode"
@@ -13,29 +10,8 @@ import (
 	"github.com/mjones/temporal-word-game/internal/game"
 	"github.com/mjones/temporal-word-game/internal/workflows"
 
-	"github.com/openai/openai-go/v3"
-	"github.com/openai/openai-go/v3/option"
-	"github.com/openai/openai-go/v3/responses"
 	"go.temporal.io/sdk/temporal"
 )
-
-const (
-	campaignToolName     = "create_wordflow_campaign"
-	defaultCampaignModel = "gpt-5.4-mini"
-	campaignToolAttempts = 5
-	// OpenAIKeyEnvironment is required by GenerateWordflowCampaign.
-	OpenAIKeyEnvironment   = "OPENAI_API_KEY"
-	openAIModelEnvironment = "OPENAI_MODEL"
-)
-
-type responseCreator interface {
-	New(context.Context, responses.ResponseNewParams, ...option.RequestOption) (*responses.Response, error)
-}
-
-type CampaignGenerator struct {
-	Responses responseCreator
-	Model     string
-}
 
 type generatedCampaign struct {
 	Description string                   `json:"description"`
@@ -48,102 +24,16 @@ type generatedWordflowLevel struct {
 	Words   []string `json:"words"`
 }
 
-func (a *CampaignGenerator) GenerateWordflowCampaign(ctx context.Context, input workflows.GenerateWordflowCampaignActivityInput) (workflows.WordflowCampaignWorkflowInput, error) {
-	spec, err := campaignSpecFor(input.Kind)
-	if err != nil {
-		return workflows.WordflowCampaignWorkflowInput{}, temporal.NewNonRetryableApplicationError(err.Error(), "invalid_campaign_kind", nil)
-	}
-
-	creator := a.Responses
-	if creator == nil {
-		if strings.TrimSpace(os.Getenv(OpenAIKeyEnvironment)) == "" {
-			return workflows.WordflowCampaignWorkflowInput{}, temporal.NewNonRetryableApplicationError(
-				OpenAIKeyEnvironment+" is required to generate a campaign",
-				"openai_not_configured",
-				nil,
-			)
-		}
-		client := openai.NewClient()
-		creator = &client.Responses
-	}
-
-	model := strings.TrimSpace(a.Model)
-	if model == "" {
-		model = strings.TrimSpace(os.Getenv(openAIModelEnvironment))
-	}
-	if model == "" {
-		model = defaultCampaignModel
-	}
-
-	prompt := spec.prompt(input)
-	params := responses.ResponseNewParams{
-		Model:        model,
-		Instructions: openai.String(campaignAgentInstructions),
-		Input: responses.ResponseNewParamsInputUnion{
-			OfString: openai.String(prompt),
-		},
-		MaxOutputTokens:   openai.Int(5000),
-		ParallelToolCalls: openai.Bool(false),
-		Store:             openai.Bool(false),
-		Tools: []responses.ToolUnionParam{{
-			OfFunction: &responses.FunctionToolParam{
-				Name:        campaignToolName,
-				Description: openai.String("Submit the complete Wordflow campaign and end the generation turn."),
-				Parameters:  campaignToolSchema(spec.levelCount),
-				Strict:      openai.Bool(true),
-			},
-		}},
-		ToolChoice: responses.ResponseNewParamsToolChoiceUnion{
-			OfFunctionTool: &responses.ToolChoiceFunctionParam{Name: campaignToolName},
-		},
-	}
-
-	var history responses.ResponseInputParam
-	var lastErr error
-	for attempt := 1; attempt <= campaignToolAttempts; attempt++ {
-		response, err := creator.New(ctx, params)
-		if err != nil {
-			return workflows.WordflowCampaignWorkflowInput{}, fmt.Errorf("generate %s campaign with OpenAI: %w", input.Kind, err)
-		}
-
-		generated, call, err := extractCampaignToolCall(response)
-		if err == nil {
-			if configured, buildErr := buildCampaign(spec, input, generated); buildErr == nil {
-				return configured, nil
-			} else {
-				err = buildErr
-			}
-		}
-		lastErr = err
-		if call.CallID == "" || attempt == campaignToolAttempts {
-			break
-		}
-
-		if len(history) == 0 {
-			history = append(history, responses.ResponseInputItemParamOfMessage(prompt, responses.EasyInputMessageRoleUser))
-		}
-		history = append(history, responses.ResponseInputItemParamOfFunctionCall(call.Arguments, call.CallID, campaignToolName))
-		toolOutput := responses.ResponseInputItemParamOfFunctionCallOutput(fmt.Sprintf(
-			`{"accepted":false,"error":%q,"instruction":"Correct the rejected campaign and call create_wordflow_campaign again."}`,
-			err.Error(),
-		))
-		toolOutput.OfFunctionCallOutput.CallID = openai.String(call.CallID)
-		history = append(history, toolOutput)
-		params.Input = responses.ResponseNewParamsInputUnion{OfInputItemList: history}
-	}
-	return workflows.WordflowCampaignWorkflowInput{}, fmt.Errorf("OpenAI did not produce a valid %s campaign after %d tool calls: %w", input.Kind, campaignToolAttempts, lastErr)
-}
-
-const campaignAgentInstructions = `You design Wordflow puzzles. The only way to finish your turn is to call the create_wordflow_campaign tool exactly once. Do not return prose or any other final response.`
+const campaignAgentInstructions = `You design Wordflow puzzles with tools. Respond only by calling tools, never with prose. Draft each level, test it with check_words and check_level, and fix whatever they report. Finish by calling submit_campaign with the complete campaign. Submitting runs the final validation: if it is rejected, read the reason, fix the campaign, and submit again.`
 
 // campaignSpec is everything that differs between the kinds of campaign the
 // generator can produce. The tool schema and level validation are shared.
 type campaignSpec struct {
 	levelCount int
-	prompt     func(workflows.GenerateWordflowCampaignActivityInput) string
+	prompt     func(workflows.CampaignRequest) string
 	// level applies the kind's timing, scoring, and hint rules to a validated level.
 	level      func(game.LevelDefinition) game.LevelDefinition
-	definition func(input workflows.GenerateWordflowCampaignActivityInput, description string) campaign.Definition
+	definition func(input workflows.CampaignRequest, description string) campaign.Definition
 }
 
 func campaignSpecFor(kind campaign.Kind) (campaignSpec, error) {
@@ -166,7 +56,7 @@ var dailyChallengeSpec = campaignSpec{
 		level.HintPrices = game.HintPrices{Letter: 15, Brush: 30, Word: 45}
 		return level
 	},
-	definition: func(input workflows.GenerateWordflowCampaignActivityInput, description string) campaign.Definition {
+	definition: func(input workflows.CampaignRequest, description string) campaign.Definition {
 		return campaign.Definition{
 			ID:            workflows.GeneratedCampaignID(campaign.KindDailyChallenge, input.Date),
 			Kind:          campaign.KindDailyChallenge,
@@ -187,7 +77,7 @@ var monthlyPackSpec = campaignSpec{
 	levelCount: 9,
 	prompt:     monthlyPackPrompt,
 	level:      func(level game.LevelDefinition) game.LevelDefinition { return level },
-	definition: func(input workflows.GenerateWordflowCampaignActivityInput, description string) campaign.Definition {
+	definition: func(input workflows.CampaignRequest, description string) campaign.Definition {
 		return campaign.Definition{
 			ID:          workflows.GeneratedCampaignID(campaign.KindMonthlyPack, input.Date),
 			Kind:        campaign.KindMonthlyPack,
@@ -215,7 +105,7 @@ const levelRules = `For every level:
 - do not pad the answer list with both a base word and its simple plural or past tense, and do not reuse an answer in another level
 - give the level a short, energetic title
 
-Before calling the tool, silently audit every answer character by character against its eight-letter multiset and replace anything questionable. The tool arguments are rejected automatically if even one answer overuses a letter or the crossword cannot be connected.`
+Check every level before you submit. check_words tests a letter bank and answer list quickly. check_level tests a whole level, including whether the crossword connects. Neither can see your other levels, and the final submission also rejects an answer that appears in two levels.`
 
 func exclusionRule(excluded []string, scope string) string {
 	if len(excluded) == 0 {
@@ -224,7 +114,7 @@ func exclusionRule(excluded []string, scope string) string {
 	return "Do not use any of these answers from " + scope + ": " + strings.Join(excluded, ", ") + "."
 }
 
-func dailyChallengePrompt(input workflows.GenerateWordflowCampaignActivityInput) string {
+func dailyChallengePrompt(input workflows.CampaignRequest) string {
 	return fmt.Sprintf(`Create the Daily Wordflow Challenge for %s.
 
 The tool call must define exactly three especially difficult but fair levels. %s
@@ -233,7 +123,7 @@ The tool call must define exactly three especially difficult but fair levels. %s
 
 The campaign is one attempt only. All three levels unlock immediately but must be played sequentially. Each level has a hard 180-second limit, awards 20 base points, and prices letter, brush, and word hints at 15, 30, and 45 points. Its active window is %s through %s. Mention the high difficulty, time pressure, richer rewards, premium hints, and single attempt in one concise campaign description.
 
-End your turn by calling create_wordflow_campaign exactly once.`,
+Finish by calling submit_campaign.`,
 		input.Date,
 		levelRules,
 		exclusionRule(input.ExcludedWords, "the previous ten daily challenges"),
@@ -242,7 +132,7 @@ End your turn by calling create_wordflow_campaign exactly once.`,
 	)
 }
 
-func monthlyPackPrompt(input workflows.GenerateWordflowCampaignActivityInput) string {
+func monthlyPackPrompt(input workflows.CampaignRequest) string {
 	return fmt.Sprintf(`Create the Wordflow Monthly Pack for %s.
 
 The tool call must define exactly nine levels that share one fun, family-friendly theme you choose for the month. Order them from approachable to challenging, so the first three suit a newcomer and the last three need real vocabulary. %s
@@ -251,100 +141,22 @@ The tool call must define exactly nine levels that share one fun, family-friendl
 
 The pack is permanent: players can work through it at their own pace with no time limit and the standard scoring. Mention the theme and the progression in one concise campaign description.
 
-End your turn by calling create_wordflow_campaign exactly once.`,
+Finish by calling submit_campaign.`,
 		input.StartsAt.Format("January 2006"),
 		levelRules,
 		exclusionRule(input.ExcludedWords, "the previous monthly packs"),
 	)
 }
 
-func campaignToolSchema(levelCount int) map[string]any {
-	return map[string]any{
-		"type":                 "object",
-		"additionalProperties": false,
-		"properties": map[string]any{
-			"description": map[string]any{
-				"type":      "string",
-				"minLength": 40,
-				"maxLength": 220,
-			},
-			"levels": map[string]any{
-				"type":     "array",
-				"minItems": levelCount,
-				"maxItems": levelCount,
-				"items": map[string]any{
-					"type":                 "object",
-					"additionalProperties": false,
-					"properties": map[string]any{
-						"title": map[string]any{
-							"type":      "string",
-							"minLength": 3,
-							"maxLength": 40,
-						},
-						"letters": map[string]any{
-							"type":      "string",
-							"pattern":   "^[A-Z]{8}$",
-							"minLength": 8,
-							"maxLength": 8,
-						},
-						"words": map[string]any{
-							"type":     "array",
-							"minItems": 10,
-							"maxItems": 10,
-							"items": map[string]any{
-								"type":      "string",
-								"pattern":   "^[A-Z]{3,8}$",
-								"minLength": 3,
-								"maxLength": 8,
-							},
-						},
-					},
-					"required": []string{"title", "letters", "words"},
-				},
-			},
-		},
-		"required": []string{"description", "levels"},
+func excludedAnswers(request workflows.CampaignRequest) map[string]bool {
+	answers := make(map[string]bool, len(request.ExcludedWords))
+	for _, answer := range request.ExcludedWords {
+		answers[strings.ToUpper(strings.TrimSpace(answer))] = true
 	}
+	return answers
 }
 
-type campaignToolCall struct {
-	CallID    string
-	Arguments string
-}
-
-func extractCampaignToolCall(response *responses.Response) (generatedCampaign, campaignToolCall, error) {
-	if response == nil {
-		return generatedCampaign{}, campaignToolCall{}, fmt.Errorf("OpenAI returned no response")
-	}
-
-	var call campaignToolCall
-	for _, item := range response.Output {
-		switch item.Type {
-		case "function_call":
-			functionCall := item.AsFunctionCall()
-			if functionCall.Name != campaignToolName {
-				return generatedCampaign{}, call, fmt.Errorf("OpenAI called unexpected tool %q", functionCall.Name)
-			}
-			if call.Arguments != "" {
-				return generatedCampaign{}, call, fmt.Errorf("OpenAI called %s more than once", campaignToolName)
-			}
-			call = campaignToolCall{CallID: functionCall.CallID, Arguments: functionCall.Arguments}
-		case "message":
-			return generatedCampaign{}, call, fmt.Errorf("OpenAI returned a message instead of ending with %s", campaignToolName)
-		}
-	}
-	if call.Arguments == "" {
-		return generatedCampaign{}, call, fmt.Errorf("OpenAI did not call %s", campaignToolName)
-	}
-
-	var generated generatedCampaign
-	if err := json.Unmarshal([]byte(call.Arguments), &generated); err != nil {
-		return generatedCampaign{}, call, fmt.Errorf("decode %s arguments: %w", campaignToolName, err)
-	}
-	return generated, call, nil
-}
-
-func buildCampaign(spec campaignSpec, input workflows.GenerateWordflowCampaignActivityInput, generated generatedCampaign) (workflows.WordflowCampaignWorkflowInput, error) {
+func buildCampaign(spec campaignSpec, input workflows.CampaignRequest, generated generatedCampaign) (workflows.WordflowCampaignWorkflowInput, error) {
 	if input.Date == "" || input.StartsAt.IsZero() || (input.EndsAt != nil && !input.EndsAt.After(input.StartsAt)) {
 		return workflows.WordflowCampaignWorkflowInput{}, temporal.NewNonRetryableApplicationError(
 			"campaign date and a valid active window are required", "invalid_campaign_input", nil,
@@ -359,10 +171,7 @@ func buildCampaign(spec campaignSpec, input workflows.GenerateWordflowCampaignAc
 	}
 
 	levels := make([]game.Puzzle, 0, len(generated.Levels))
-	allAnswers := make(map[string]bool, len(input.ExcludedWords)+10*spec.levelCount)
-	for _, answer := range input.ExcludedWords {
-		allAnswers[strings.ToUpper(strings.TrimSpace(answer))] = true
-	}
+	allAnswers := excludedAnswers(input)
 	for index, level := range generated.Levels {
 		definition, err := validateGeneratedWordflowLevel(index+1, level, allAnswers)
 		if err != nil {
