@@ -140,7 +140,7 @@ async function showPlayer(initialCatalog, initialGame) {
   elements["player-name"].hidden = false;
   elements["player-name"].textContent = player.displayName;
   elements["player-workflow"].hidden = false;
-  elements["player-workflow"].href = "/api/me/workflow-link";
+  elements["player-workflow"].href = "/workflows/";
   elements["player-workflow"].removeAttribute("aria-disabled");
   elements.logout.hidden = false;
   renderPlayer();

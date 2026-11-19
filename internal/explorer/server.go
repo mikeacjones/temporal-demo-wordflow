@@ -264,9 +264,7 @@ func (s *Server) viewer(request *http.Request) viewer {
 
 func listFilter(playerID string) string {
 	public := []string{
-		fmt.Sprintf("WorkflowId = '%s'", workflows.CatalogWorkflowID),
 		fmt.Sprintf("WorkflowId STARTS_WITH '%s'", workflows.CampaignGeneratorWorkflowIDPrefix),
-		fmt.Sprintf("WorkflowId = '%s'", workflows.LeaderboardWorkflowID),
 		"WorkflowId STARTS_WITH 'wordflow-campaign/'",
 	}
 	publicFilter := "(" + strings.Join(public, " OR ") + ")"
@@ -274,18 +272,13 @@ func listFilter(playerID string) string {
 		return "ExecutionStatus != 'Terminated' AND ExecutionStatus != 'Completed' AND " + publicFilter
 	}
 
-	owned := []string{
-		fmt.Sprintf("WorkflowId = '%s'", workflows.PlayerWorkflowID(playerID)),
-		fmt.Sprintf("WorkflowId STARTS_WITH 'wordflow-level/%s/'", playerID),
-	}
-	ownedFilter := "(" + strings.Join(owned, " OR ") + ")"
+	ownedFilter := fmt.Sprintf("WorkflowId STARTS_WITH 'wordflow-level/%s/'", playerID)
 	return "ExecutionStatus != 'Terminated' AND ((ExecutionStatus != 'Completed' AND " +
 		publicFilter + ") OR " + ownedFilter + ")"
 }
 
 func canViewWorkflowID(playerID, workflowID string) bool {
-	if workflowID == workflows.CatalogWorkflowID || workflowID == workflows.LeaderboardWorkflowID ||
-		strings.HasPrefix(workflowID, workflows.CampaignGeneratorWorkflowIDPrefix) ||
+	if strings.HasPrefix(workflowID, workflows.CampaignGeneratorWorkflowIDPrefix) ||
 		strings.HasPrefix(workflowID, "wordflow-campaign/") {
 		return true
 	}
@@ -307,8 +300,7 @@ func playerOwnsWorkflow(playerID, workflowID string) bool {
 	if playerID == "" {
 		return false
 	}
-	return workflowID == workflows.PlayerWorkflowID(playerID) ||
-		strings.HasPrefix(workflowID, "wordflow-level/"+playerID+"/")
+	return strings.HasPrefix(workflowID, "wordflow-level/"+playerID+"/")
 }
 
 func summarizeWorkflow(info *workflowpb.WorkflowExecutionInfo, workflowID string) workflowSummary {
@@ -335,16 +327,10 @@ func summarizeWorkflow(info *workflowpb.WorkflowExecutionInfo, workflowID string
 
 func workflowKind(workflowID string) string {
 	switch {
-	case workflowID == workflows.CatalogWorkflowID:
-		return "catalog"
 	case strings.HasPrefix(workflowID, workflows.CampaignGeneratorWorkflowIDPrefix):
 		return "campaign generator"
-	case workflowID == workflows.LeaderboardWorkflowID:
-		return "leaderboard"
 	case strings.HasPrefix(workflowID, "wordflow-campaign/"):
 		return "campaign"
-	case strings.HasPrefix(workflowID, "player/"):
-		return "player"
 	case strings.HasPrefix(workflowID, "wordflow-level/"):
 		return "level"
 	default:
@@ -353,7 +339,7 @@ func workflowKind(workflowID string) string {
 }
 
 func workflowVisibility(workflowID string) string {
-	if strings.HasPrefix(workflowID, "player/") || strings.HasPrefix(workflowID, "wordflow-level/") {
+	if strings.HasPrefix(workflowID, "wordflow-level/") {
 		return "private"
 	}
 	return "public"
@@ -361,12 +347,9 @@ func workflowVisibility(workflowID string) string {
 
 func safeWorkflowType(name string) string {
 	known := []string{
-		workflows.CatalogWorkflowName,
 		workflows.WordflowCampaignGeneratorWorkflowName,
 		workflows.WordflowCampaignWorkflowName,
-		workflows.PlayerWorkflowName,
 		workflows.WordflowLevelWorkflowName,
-		workflows.LeaderboardWorkflowName,
 	}
 	if slices.Contains(known, name) {
 		return name
@@ -376,24 +359,17 @@ func safeWorkflowType(name string) string {
 
 func safeOperationName(name string) string {
 	known := []string{
-		workflows.UpdateOpenCatalog,
-		workflows.UpdateRegisterCampaign,
-		workflows.UpdateUnregisterCampaign,
-		workflows.UpdateAuthenticatePlayer,
 		workflows.UpdateStartLevel,
-		workflows.UpdateSpendPoints,
-		workflows.UpdateBuyStreakFreeze,
 		workflows.UpdateSubmitGuess,
 		workflows.UpdateUseHint,
 		workflows.SignalRequestVersionUpgrade,
-		workflows.SignalLeaderboardScore,
 		workflows.ActivityRegisterCampaign,
 		workflows.ActivityUnregisterCampaign,
 		workflows.ActivityRunCampaignAgentTurn,
 		workflows.ActivityExecuteCampaignTool,
-		workflows.ActivityResolveWordflowLevel,
+		workflows.ActivityClaimLevel,
 		workflows.ActivitySpendPoints,
-		workflows.ActivityPublishLeaderboard,
+		workflows.ActivityRecordLevelResult,
 	}
 	if slices.Contains(known, name) {
 		return name

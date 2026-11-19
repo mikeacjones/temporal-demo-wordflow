@@ -3,104 +3,40 @@ package activities
 import (
 	"context"
 	"errors"
+	"time"
 
+	"github.com/mjones/temporal-word-game/internal/catalog"
+	"github.com/mjones/temporal-word-game/internal/store"
 	"github.com/mjones/temporal-word-game/internal/workflows"
 
-	"go.temporal.io/api/enums/v1"
-	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
 )
 
+// CampaignStore is the part of the store the campaign Activities use.
+type CampaignStore interface {
+	PutCampaign(ctx context.Context, registration catalog.Registration, registeredAt time.Time) error
+	DeleteCampaign(ctx context.Context, campaignID, workflowID string) error
+}
+
+// Campaigns publishes campaigns to the catalog and takes them down.
 type Campaigns struct {
-	Temporal  client.Client
-	Provider  *TemporalClientProvider
-	TaskQueue string
+	Store CampaignStore
 }
 
 func (a *Campaigns) RegisterCampaign(ctx context.Context, input workflows.RegisterCampaignActivityInput) error {
-	temporalClient, err := activityTemporalClient(a.Temporal, a.Provider)
-	if err != nil {
-		return err
+	if err := catalog.Validate(input.Registration); err != nil {
+		return temporal.NewNonRetryableApplicationError(err.Error(), "invalid_campaign_registration", err)
 	}
-
-	start := temporalClient.NewWithStartWorkflowOperation(client.StartWorkflowOptions{
-		ID:                       workflows.CatalogWorkflowID,
-		TaskQueue:                a.taskQueue(),
-		WorkflowIDConflictPolicy: enums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-		WorkflowIDReusePolicy:    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
-	}, workflows.CatalogWorkflowName, workflows.CatalogWorkflowInput{})
-	handle, err := temporalClient.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
-		StartWorkflowOperation: start,
-		UpdateOptions: client.UpdateWorkflowOptions{
-			UpdateID: input.UpdateID, UpdateName: workflows.UpdateRegisterCampaign,
-			WaitForStage: client.WorkflowUpdateStageCompleted, Args: []any{input.Registration},
-		},
-	})
-	if err != nil {
-		return err
+	err := a.Store.PutCampaign(ctx, input.Registration, time.Now())
+	if errors.Is(err, store.ErrCampaignClaimed) {
+		return temporal.NewNonRetryableApplicationError(
+			"campaign "+input.Registration.Definition.ID+" is registered by another workflow",
+			"campaign_already_registered", err,
+		)
 	}
-	var added bool
-	if err := handle.Get(ctx, &added); err != nil {
-		var applicationError *temporal.ApplicationError
-		if errors.As(err, &applicationError) {
-			return temporal.NewNonRetryableApplicationError(applicationError.Message(), applicationError.Type(), err)
-		}
-		return err
-	}
-	return nil
+	return err
 }
 
 func (a *Campaigns) UnregisterCampaign(ctx context.Context, input workflows.UnregisterCampaignActivityInput) error {
-	temporalClient, err := activityTemporalClient(a.Temporal, a.Provider)
-	if err != nil {
-		return err
-	}
-
-	handle, err := temporalClient.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
-		WorkflowID:   workflows.CatalogWorkflowID,
-		UpdateID:     input.UpdateID,
-		UpdateName:   workflows.UpdateUnregisterCampaign,
-		WaitForStage: client.WorkflowUpdateStageCompleted,
-		Args: []any{workflows.UnregisterCampaignInput{
-			CampaignID: input.CampaignID,
-			WorkflowID: input.WorkflowID,
-		}},
-	})
-	if err != nil {
-		return err
-	}
-	var removed bool
-	if err := handle.Get(ctx, &removed); err != nil {
-		var applicationError *temporal.ApplicationError
-		if errors.As(err, &applicationError) {
-			return temporal.NewNonRetryableApplicationError(applicationError.Message(), applicationError.Type(), err)
-		}
-		return err
-	}
-	return nil
-}
-
-func (a *Campaigns) ResolveWordflowLevel(ctx context.Context, input workflows.ResolveWordflowLevelActivityInput) (workflows.WordflowLevelResolution, error) {
-	temporalClient, err := activityTemporalClient(a.Temporal, a.Provider)
-	if err != nil {
-		return workflows.WordflowLevelResolution{}, err
-	}
-
-	result, err := temporalClient.QueryWorkflow(ctx, workflows.CatalogWorkflowID, "",
-		workflows.QueryCatalogWordflowLevel, input.Query)
-	if err != nil {
-		return workflows.WordflowLevelResolution{}, err
-	}
-	var resolution workflows.WordflowLevelResolution
-	if err := result.Get(&resolution); err != nil {
-		return workflows.WordflowLevelResolution{}, err
-	}
-	return resolution, nil
-}
-
-func (a *Campaigns) taskQueue() string {
-	if a.TaskQueue != "" {
-		return a.TaskQueue
-	}
-	return workflows.TaskQueue
+	return a.Store.DeleteCampaign(ctx, input.CampaignID, input.WorkflowID)
 }

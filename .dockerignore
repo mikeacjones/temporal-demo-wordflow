@@ -1,8 +1,4 @@
 .git
 .temporal
 dist
-deploy
 .env*
-*.tfstate
-*.tfstate.*
-*.tfvars

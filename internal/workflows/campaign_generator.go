@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/mjones/temporal-word-game/internal/campaign"
+	"github.com/mjones/temporal-word-game/internal/player"
 
 	"go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/temporal"
@@ -261,6 +262,9 @@ type campaignPeriod struct {
 }
 
 // generatedCampaignPeriod returns the Toronto-time period that now falls in.
+// torontoLocation is the game's calendar: a daily challenge runs midnight to midnight there.
+var torontoLocation = player.Location
+
 func generatedCampaignPeriod(kind campaign.Kind, now time.Time) (campaignPeriod, error) {
 	local := now.In(torontoLocation)
 	switch kind {

@@ -1,45 +1,47 @@
 # Temporal Wordflow
 
-Temporal Wordflow is an unofficial Temporal-themed word-crossword game built to
-make entity Workflows easy to study. Temporal owns all durable catalog,
-campaign, player, level, and leaderboard state. There is no application
-database, cache, or object store.
+A Temporal-themed word-crossword game where every move a player makes is a
+Workflow Update, and an AI agent loop writes a new daily challenge every night.
 
-Players sign up with a username, display name, and password. The normalized
-username becomes the human-readable entity ID in `player/{username}` and
-`wordflow-level/{username}/{campaign}/{level}`. Before calling Temporal, the API derives a stable
-PBKDF2-SHA256 password hash using a username-derived salt. The browser keeps the
-API-signed JWT in an HTTP-only cookie. The Player Workflow stores the password
-hash used to claim the account, while the stateless API verifies the JWT before
-calling Temporal.
+- Each level is a [Workflow](https://docs.temporal.io/workflows) started with
+  [Update-With-Start](https://docs.temporal.io/develop/go/message-passing#update-with-start);
+  guesses and hints are [Updates](https://docs.temporal.io/encyclopedia/workflow-message-passing#sending-updates),
+  and a durable timer ends a timed level.
+- [Schedules](https://docs.temporal.io/schedule) start the daily challenge and
+  monthly pack generators, which run an OpenAI agent loop with each model turn
+  and tool call as an Activity.
+- Workers use [Worker Versioning](https://docs.temporal.io/worker-versioning)
+  with Pinned Workflows, rolled out by the Temporal Worker Controller.
+- Player accounts, scores and the campaign catalog live in DynamoDB.
 
-The public display name receives a stable eight-character discriminator derived
-from that unique username, such as `Michael#8f3a1c2d`. The tagged value is stored
-on first registration and used by the leaderboard.
+## How it works
 
-## State ownership
+Workflows hold what is in motion: a level being played, a campaign's open
+window, a generation run. DynamoDB holds what outlives them.
 
 | Component | Owns | Lifetime |
 | --- | --- | --- |
-| `CatalogWorkflow` | Immutable campaign snapshots used to render campaign cards and authorize level starts | Singleton entity; Continue-As-New keeps history bounded |
-| `WordflowCampaignGeneratorWorkflow` | Runs an OpenAI agent loop that designs and checks one campaign (a daily challenge or a monthly pack), then starts it | One run per Schedule fire; the Schedule hands each run the previous run's answers as its last completion result |
-| `WordflowCampaignWorkflow` | One campaign's levels, unlock schedule, prerequisites, availability dates, and expiration timer | Permanent campaigns stay open; time-bounded campaigns complete at expiration |
-| `PlayerWorkflow` | Password hash, display name, campaign progress, points, rewards, streaks, and the active level reference | Long-lived entity; Continue-As-New keeps history bounded |
-| `WordflowLevelWorkflow` | One player's level answers, guesses, revealed cells, hints, timing, scoring, and completion | Runs until the level is solved or its hard limit expires; can Continue-As-New after heavy use |
-| `LeaderboardWorkflow` | The top 100 absolute lifetime-point snapshots | Singleton entity; Continue-As-New keeps history bounded |
-| HTTP API | Nothing durable; verifies signed session JWTs and translates HTTP requests into Updates and Queries | Stateless |
-| Browser | The HTTP-only session JWT, transient letter ordering, and letters currently selected on screen | Local session and presentation state only |
+| `WordflowLevelWorkflow` | One player's attempt at one level: answers found, guesses, hints, timing and score | From the first move until it is solved, runs out of time, or sits untouched for 24 hours with no time limit |
+| `WordflowCampaignWorkflow` | Publishing one campaign to the catalog, and taking a dated one down when it ends | A permanent campaign completes once published; a dated one at its end time |
+| `WordflowCampaignGeneratorWorkflow` | Designing one daily challenge or monthly pack with an agent loop, then starting its campaign | One run per Schedule fire |
+| DynamoDB `players` table | Each player's password hash, display name, points, streak, campaign progress and the one level they have open; its `leaderboard` index ranks lifetime points | Permanent |
+| DynamoDB `campaigns` table | The snapshot of every published campaign | Until the campaign ends |
+| HTTP API | Nothing durable; it signs session JWTs, reads the tables and sends Updates | Stateless |
 
-All mutations use Workflow Updates because the UI needs an accepted result.
-Queries rebuild screens without changing state. HTTP request IDs are passed as
-Temporal Update IDs, so Temporal deduplicates retries without a request ledger
-in Workflow state.
+Starting a level is one call: the API sends Update-With-Start to
+`wordflow-level/{player}/{campaign}/{level}`. The `start-level` Update runs a
+`ClaimLevel` Activity, which checks the catalog's unlock and eligibility rules
+against the player's record and marks the level open there, then returns the
+board. A refused claim comes back as the Update's error and the Workflow ends.
+Guesses and hints are Updates on the same Workflow. A paid hint runs a
+`SpendPoints` Activity. When the level ends, a `RecordLevelResult` Activity adds
+the points, streak and progress to the player's record. That Activity is safe to
+retry: a result for a level that is no longer open is ignored. HTTP request IDs
+are the Update IDs, so Temporal deduplicates retried requests.
 
-A campaign registers its immutable definition and level snapshot with
-`catalog/global` through a short Activity that performs Update-with-Start. The
-Catalog derives every player-specific campaign card in one Query, so the API
-does not fan out to each Campaign Workflow. A campaign with an end time removes
-its snapshot and completes when that time arrives.
+Player records are written with optimistic concurrency: each write is
+conditional on the version it read, and a conflicting write reads again and
+reapplies its change.
 
 Two Temporal Schedules create new campaigns. The worker creates them at startup
 if they do not exist and leaves existing ones untouched, so a pause or edit made
@@ -78,71 +80,32 @@ Temporal passes that result to the Schedule's next run, which rejects any answer
 already used.
 Both Schedules skip a run that overlaps a still-running one.
 
-To start a level, the Player runs a short Activity that asks the Catalog to
-resolve the registered campaign snapshot against its compact progress. The
-Catalog owns eligibility and unlock decisions and returns an immutable Wordflow
-level definition. The Player starts `WordflowLevelWorkflow` as a child, returns
-the initial game view in the same Update result, and keeps the child Future in
-the main event loop. The child returns only a small game-independent level
-result. The Player does not Continue-As-New while that child is open.
+## Code tour
 
-Registration sends an authentication Update through Update-with-Start to
-`player/{username}`. The first accepted Update claims that username; later calls
-must supply the same password hash and return the current `PlayerView`. Login
-uses the same Update against an existing Workflow without Update-with-Start, so
-an unknown username returns `account does not exist` and cannot reserve a name.
-After that credential check, the API issues a 30-day HMAC-signed JWT. Normal
-requests validate it entirely in the API and query player state only when the
-endpoint actually needs that state. Session creation, validation, and logout
-remain HTTP API concerns; the Player Workflow stores no session tokens.
+- [`internal/workflows/wordflow_level.go`](internal/workflows/wordflow_level.go):
+  the level Workflow, from claim to recorded result.
+- [`internal/workflows/wordflow_campaign.go`](internal/workflows/wordflow_campaign.go):
+  publish a campaign, then take it down at its end time.
+- [`internal/workflows/campaign_generator.go`](internal/workflows/campaign_generator.go):
+  the generation agent loop.
+- [`internal/activities/levels.go`](internal/activities/levels.go): the
+  Activities that change a player's record.
+- [`internal/player`](internal/player/player.go) and
+  [`internal/catalog`](internal/catalog/catalog.go): the game rules for points,
+  streaks, unlocks and eligibility, shared by the API and the Activities.
+- [`internal/store`](internal/store/store.go): the DynamoDB tables.
+- [`internal/bootstrap/temporal-foundations.json`](internal/bootstrap/temporal-foundations.json):
+  the default campaign, published again each time the web app starts.
 
-After a completed level updates Player state, a small Activity uses
-Signal-With-Start to publish an absolute score snapshot to `leaderboard/global`.
-The leaderboard ignores older player versions, so Activity retries cannot add
-points twice. The public `/leaderboard` page queries that Workflow every three
-seconds and can run independently on an event display.
-
-Hints belong only to a Wordflow level. When its free inventory reaches zero, that level
-sets its own price and runs a `SpendPoints` Activity. The Activity sends an
-Update to the Player Workflow because Workflows cannot send Updates directly to
-other Workflows. Its Update ID is derived from the level Workflow ID and the
-originating level Update ID, making Activity retries safe without custom
-deduplication state. The Player Workflow only validates ownership and the
-current balance, then atomically deducts the requested amount.
-
-The workflow code is intentionally direct:
-
-- [`internal/workflows/catalog.go`](internal/workflows/catalog.go) contains the
-  campaign registry.
-- [`internal/workflows/wordflow_campaign.go`](internal/workflows/wordflow_campaign.go)
-  contains Wordflow campaign lifecycle and eligibility rules.
-- [`internal/workflows/player.go`](internal/workflows/player.go) contains the
-  complete player state machine.
-- [`internal/workflows/wordflow_level.go`](internal/workflows/wordflow_level.go)
-  contains the complete Wordflow level state machine.
-- [`internal/workflows/leaderboard.go`](internal/workflows/leaderboard.go)
-  contains the bounded ranking projection.
-- [`internal/activities/points.go`](internal/activities/points.go) contains the
-  one cross-Workflow client call used to spend points.
-- [`internal/bootstrap/temporal-foundations.json`](internal/bootstrap/temporal-foundations.json)
-  seeds the default campaign. Once started, its Workflow state is authoritative.
-- [`internal/game/catalog.go`](internal/game/catalog.go) builds and validates a
-  configured crossword layout before it enters Workflow state.
-
-To add another Wordflow campaign, build a `WordflowCampaignWorkflowInput` from
-configuration and start it with `wordflow-campaign/{campaign-id}`. It registers
-itself with the Catalog, and the existing API and UI discover it through the
-common campaign queries. A future game type supplies its own campaign and level
-Workflows while reusing the small Catalog registration, campaign view, player
-progress, and level-result contracts; the game-specific path remains explicit
-instead of hiding behavior behind a generic payload layer.
-
+To add a campaign, build a `WordflowCampaignWorkflowInput` and start it as
+`wordflow-campaign/{campaign-id}`; it publishes itself to the catalog.
 The repository also includes a small manual campaign starter. It parses the
 same compact level format as the permanent campaign, builds the crossword
-layouts, and starts the durable campaign entity:
+layouts, and starts its Campaign Workflow:
 
 ```bash
-go run ./cmd/campaign -file campaigns/daily-challenge-2026-09-21.json
+docker compose --profile test run --rm -e TEMPORAL_ADDRESS=temporal:7233 test \
+  go run ./cmd/campaign -file campaigns/daily-challenge-2026-09-21.json
 ```
 
 The worker refuses to start without `OPENAI_API_KEY`, because it creates the
@@ -150,9 +113,9 @@ generation Schedules. `OPENAI_MODEL` is optional and defaults to `gpt-5.4-mini`.
 Start a worker, then run a Schedule now instead of waiting for its time:
 
 ```bash
-OPENAI_API_KEY=... make worker
-temporal schedule trigger --schedule-id wordflow-daily-challenge
-temporal schedule trigger --schedule-id wordflow-monthly-pack
+OPENAI_API_KEY=... make up
+docker compose exec temporal temporal schedule trigger --schedule-id wordflow-daily-challenge
+docker compose exec temporal temporal schedule trigger --schedule-id wordflow-monthly-pack
 ```
 
 A trigger creates the campaign for the current period. A second trigger in the
@@ -167,9 +130,10 @@ one generation.
 - Levels are sequential and guesses are unlimited.
 - Campaign prerequisites are all-of requirements over completed campaigns and
   completed campaign levels.
-- Leaving gameplay returns to the campaign browser without closing the active
-  child Workflow. The player can resume it but cannot start another level until
-  it completes.
+- Leaving gameplay returns to the campaign browser without closing the level's
+  Workflow. The player can resume it but cannot start another level until it
+  ends. A level with no time limit that sees no guess or hint for 24 hours
+  ends as abandoned and can be started again.
 - An ended campaign rejects new level starts; a level started before the end may
   finish.
 - A daily challenge is a dated, single-attempt campaign with three immediately
@@ -200,61 +164,38 @@ one generation.
   consumed to protect the streak after exactly one missed Toronto calendar day.
 - The included campaign has 30 Temporal-themed levels and two short bonus events.
 
-## Continue-As-New and deployments
+## Run it
 
-Each mutable workflow carries its complete state in one serializable structure.
-Catalog, Player, Level, and Leaderboard Workflows Continue-As-New when Temporal
-recommends it or when a new target Worker Deployment Version is available. A
-level can Continue-As-New while it is active. The player does not Continue-As-New
-while it has an active level child; it waits for the child result while remaining
-responsive to Updates. Before continuing, each workflow waits for its Update
-handlers to finish. Campaign definitions are immutable after start. Permanent
-Campaign Workflows stay open for inspection; time-bounded campaigns unregister
-and complete when their expiration timer fires.
-
-Lambda workflows are registered as `Pinned`. At a Continue-As-New boundary,
-the new run opts into the target Worker Deployment Version when one is
-available. This is the cleanest upgrade boundary for permanent entity
-workflows, but both Serverless Workers and upgrading pinned workflows at a
-Continue-As-New boundary are currently preview features.
-
-## Run locally
-
-Requirements: Go 1.26 or newer and the Temporal CLI.
-
-Use three terminals:
+Requirements: Docker with Compose.
 
 ```bash
-make temporal
+make up
 ```
-
-```bash
-make worker
-```
-
-```bash
-make server
-```
-
-The `server` target supplies a local-only `SESSION_JWT_SECRET`. Set that
-environment variable to a private value of at least 32 characters for any
-other deployment; every API replica must use the same value.
 
 Then open <http://localhost:8080>. The Temporal UI is at
-<http://localhost:8233>. The standalone event leaderboard is at
-<http://localhost:8080/leaderboard>.
+<http://localhost:8233> and the event leaderboard at
+<http://localhost:8080/leaderboard>. Compose runs a Temporal dev server,
+DynamoDB Local (in memory, emptied on restart), the worker and the web app; the
+worker and web app create the tables in DynamoDB Local.
 
-To present the demo, follow [RUNBOOK.md](RUNBOOK.md): the walkthrough beat by beat, and where in the code each part happens.
+| Command | Does |
+| --- | --- |
+| `make up` | Build and start the stack |
+| `make down` | Stop it |
+| `make test` | Run every test in a container, the store tests against DynamoDB Local |
+| `make vet` | `go vet` in a container |
+| `make workflowcheck` | Check Workflow code for non-determinism |
+
+To present the demo, follow [RUNBOOK.md](RUNBOOK.md).
 
 ### Read-only Workflow Explorer
 
 The web app includes an application-aware Workflow Explorer at
 <http://localhost:8080/workflows/>.
 It reads Visibility, Describe, and Event History data without issuing Workflow
-Queries, Updates, or Signals. Anonymous visitors can inspect sanitized catalog,
-campaign, campaign-generator, and leaderboard executions. A browser carrying a
-valid Wordflow session cookie can also inspect that player's Player and Level
-Workflows. Event details are decoded and sanitized at the API boundary;
+Queries, Updates, or Signals. Anonymous visitors can inspect sanitized campaign
+and campaign-generator executions. A browser carrying a valid Wordflow session
+cookie can also inspect that player's level Workflows. Event details are decoded and sanitized at the API boundary;
 credentials, puzzle answers, headers, identities, failure messages, memos, and
 search attributes are never sent to the browser.
 
@@ -262,131 +203,33 @@ The explorer is served by the same web/API process and uses the same session
 cookie, but neither the page nor its read-only endpoints execute or modify
 Workflow state.
 
-`make temporal` stores the development Temporal database in `.temporal/`.
-That SQLite file belongs to the Temporal development service; the application
-still has no separate persistence system.
+## Configuration
 
-Run validation with:
+| Variable | Used by | Notes |
+| --- | --- | --- |
+| `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY`, `TEMPORAL_TLS` | worker, web | Temporal connection |
+| `WORDFLOW_PLAYERS_TABLE`, `WORDFLOW_CAMPAIGNS_TABLE` | worker, web | Required; both programs stop at startup without them |
+| `DYNAMODB_ENDPOINT` | worker, web | DynamoDB Local only; the programs create the tables there |
+| `TEMPORAL_WORKER_BUILD_ID`, `TEMPORAL_DEPLOYMENT_NAME` | worker | Set by the Worker Controller; without a Build ID the worker is unversioned |
+| `OPENAI_API_KEY`, `OPENAI_MODEL` | worker | Required for campaign generation; the model defaults to `gpt-5.4-mini` |
+| `SESSION_JWT_SECRET` | web | At least 32 characters, the same on every replica |
 
-```bash
-make test
-make vet
-make workflowcheck
-```
-
-## AWS Lambda worker profile
-
-[`cmd/lambda-worker/main.go`](cmd/lambda-worker/main.go) uses Temporal's
-`lambdaworker` package. It registers the exact same workflows as the local
-worker, including the campaign-generation, point-spend, and leaderboard-publishing Activities, while enabling the pinned
-versioning behavior required by Serverless Workers.
-
-Build an AWS Lambda custom-runtime zip without generating any AWS deployment
-configuration:
-
-```bash
-make lambda
-```
-
-The artifact is `dist/temporal-word-game-worker.zip`. It contains a Linux
-`bootstrap` binary built with the required `lambda.norpc` tag. Set these Lambda
-environment variables:
-
-- `TEMPORAL_ADDRESS`
-- `TEMPORAL_NAMESPACE`
-- `TEMPORAL_API_KEY`
-- `TEMPORAL_TASK_QUEUE=temporal-word-game`
-- `TEMPORAL_WORKER_BUILD_ID`, uniquely identifying this immutable Lambda build
-- `OPENAI_API_KEY`, used only by the campaign-generation Activity
-- `OPENAI_MODEL`, optional; defaults to `gpt-5.4-mini`
-
-Publish the function as an immutable Lambda version and map that qualified ARN
-one-to-one to the same Temporal Worker Deployment Build ID. Temporal's current
-setup and IAM steps are documented in the
-[Serverless Worker deployment guide](https://docs.temporal.io/production-deployment/worker-deployments/serverless-workers/aws-lambda).
-
-The web API can run anywhere that can reach Temporal. It remains stateless and
-does not need to share a process or filesystem with a Worker.
-
-## Kubernetes steady worker
-
-[`docker/worker.Dockerfile`](docker/worker.Dockerfile) builds the long-running
-worker for steady Kubernetes traffic. Set `TEMPORAL_WORKER_BUILD_ID` to the
-same Build ID as the Lambda worker so both processes poll the same pinned
-Worker Deployment Version. Without that variable, the worker remains
-unversioned for local development.
-
-## Serverless AWS deployment
-
-[`deploy/terraform`](deploy/terraform) creates an isolated, disposable test
-stack in the AWS account and Region selected by the active AWS CLI
-configuration and the Temporal Cloud Account selected by the provider:
-
-- a fresh Temporal Cloud Namespace, Namespace-scoped service account, and
-  runtime API key;
-- an immutable, published Worker Lambda version;
-- one provisioned Worker Lambda environment to reduce first-use startup delay;
-- a Temporal Cloud Worker Deployment Version whose Build ID combines the Git
-  SHA with a fingerprint of the exact application source;
-- a stateless web/API Lambda serving the embedded UI and API;
-- one provisioned API Lambda environment with additional CPU for password
-  hashing and initialization;
-- an API Gateway HTTP API using its AWS-provided URL;
-- separate Lambda execution and Temporal Cloud invocation roles;
-- CloudWatch log groups; and
-- a Secrets Manager secret containing the Temporal Cloud API key.
-
-The defaults place both Lambda and the Temporal Cloud Namespace in AWS
-`ca-central-1`, which is enabled for the demo account. Keep `aws_region` and
-`temporal_region` colocated when overriding either one; every game interaction
-includes at least one Temporal round trip. Set either provisioned-concurrency
-variable to zero when complete scale-to-zero is more important than first-use
-latency.
-
-Terraform also generates a stable JWT signing secret and supplies it only to
-the API Lambda.
-
-The provider creates the runtime key and writes it to Secrets Manager. The
-Lambdas receive only the secret ID and resolve the credential at cold start.
-The runtime identity is restricted to the generated Namespace.
-
-Set a short-lived account API key for the Temporal Cloud provider, then run:
-
-```bash
-export TEMPORAL_CLOUD_API_KEY='your Temporal Cloud account API key'
-terraform -chdir=deploy/terraform init
-terraform -chdir=deploy/terraform apply
-```
-
-The bootstrap key must be allowed to create Namespaces, service accounts, and
-API keys in the configured Temporal Cloud Account. Terraform creates the
-application credential separately. The default Account ID is `a2dd6`; override
-`temporal_account_id` in a `.tfvars` file for another Account.
-
-Re-running `terraform apply` after a source change builds and publishes a new
-Worker Lambda version, registers the matching source fingerprint as a Temporal
-Worker Deployment Version, confirms that it bound the Task Queue, and then
-makes it current. The apply also starts the permanent and temporary seed
-campaigns and waits for their Catalog registrations, so the returned URL is
-ready to test. Older Lambda and Worker Deployment Versions remain available for
-Workflows pinned to their original code. Run `terraform destroy` to remove the
-entire generated Namespace and AWS stack.
-
-The web/API Lambda owns no application state. It keeps only its JWT signing
-secret and a reusable Temporal client during a warm invocation; all durable
-accounts, campaigns, levels, scores, points, and leaderboard data remain in
-Temporal Cloud.
-
-Workflow links in the web app open the read-only, application-aware explorer at
-`/workflows/`. This keeps private Player and Level executions behind the same
-Wordflow session boundary instead of linking visitors to Temporal Cloud.
+On the demo platform, the DemoProject (`projects/{test,live}/demo/wordflow.yaml`
+in temporal-sa/temporal-fieldkit-platform) declares both tables in `spec.aws`,
+which also gives the pods their AWS credentials, and runs the worker under the
+Worker Controller. A version with Pinned Workflows still open keeps its pods
+until they finish.
 
 ## Identity model
 
-Signup is local to the application: the unique `player/{username}` Workflow ID
-is the username claim, while the Player Workflow owns the password hash and the
-API signs and verifies session JWTs. Raw passwords never enter Workflow history. This deliberately small
-authentication model is suitable for the demo; its deterministic password hash
-is still vulnerable to offline guessing if Workflow data is exposed, and it
-does not attempt email verification, account recovery, MFA, or distributed
-request rate limiting.
+Signup is local to the application. The normalized username is the player's
+key in the `players` table and appears in level Workflow IDs. Before storing
+anything, the API derives a PBKDF2-SHA256 password hash with a username-derived
+salt; raw passwords are never stored or sent to Temporal. The browser keeps an
+API-signed JWT in an HTTP-only cookie. The public display name gets a stable
+eight-character discriminator derived from the username, such as
+`Michael#8f3a1c2d`.
+
+This small authentication model suits a demo: its deterministic hash is still
+open to offline guessing if the table is exposed, and there is no email
+verification, account recovery, MFA, or distributed rate limiting.

@@ -11,11 +11,33 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 )
 
-func testSpendPointsActivity(context.Context, SpendPointsActivityInput) (SpendPointsResult, error) {
-	return SpendPointsResult{}, nil
+// newLevelTestEnv is a test environment whose ClaimLevel Activity hands out
+// puzzle and whose other Activities succeed, with the start-level Update sent
+// as soon as the Workflow starts. Tests that pass a State skip the claim.
+func newLevelTestEnv(t *testing.T, puzzle game.Puzzle) *testsuite.TestWorkflowEnvironment {
+	t.Helper()
+	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
+	env.RegisterActivityWithOptions(func(context.Context, ClaimLevelActivityInput) (ClaimLevelResult, error) {
+		return ClaimLevelResult{Player: game.PlayerView{DisplayName: "Test"}, Puzzle: puzzle, TotalLevels: 2}, nil
+	}, activity.RegisterOptions{Name: ActivityClaimLevel})
+	env.RegisterActivityWithOptions(func(context.Context, SpendPointsActivityInput) (SpendPointsResult, error) {
+		return SpendPointsResult{}, nil
+	}, activity.RegisterOptions{Name: ActivitySpendPoints})
+	env.RegisterActivityWithOptions(func(context.Context, RecordLevelResultActivityInput) error {
+		return nil
+	}, activity.RegisterOptions{Name: ActivityRecordLevelResult})
+	env.RegisterDelayedCallback(func() {
+		env.UpdateWorkflow(UpdateStartLevel, "start", &testsuite.TestUpdateCallback{
+			OnReject:   func(err error) { require.NoError(t, err) },
+			OnComplete: func(_ any, err error) { require.NoError(t, err) },
+		}, StartLevelInput{})
+	}, 0)
+	return env
 }
 
 func testPuzzle(t *testing.T, level int) game.Puzzle {
@@ -32,8 +54,7 @@ func testPuzzle(t *testing.T, level int) game.Puzzle {
 func TestWordflowLevelWorkflowCompletesThroughUpdates(t *testing.T) {
 	puzzle := testPuzzle(t, 1)
 
-	suite := testsuite.WorkflowTestSuite{}
-	env := suite.NewTestWorkflowEnvironment()
+	env := newLevelTestEnv(t, puzzle)
 
 	for index, word := range puzzle.Words {
 		index, answer := index, word.Answer
@@ -45,7 +66,7 @@ func TestWordflowLevelWorkflowCompletesThroughUpdates(t *testing.T) {
 	}
 
 	env.ExecuteWorkflow(WordflowLevelWorkflow, WordflowLevelWorkflowInput{
-		PlayerID: "test-player", CampaignID: "test-campaign", Puzzle: puzzle,
+		PlayerID: "test-player", CampaignID: "test-campaign", Level: puzzle.Level,
 	})
 
 	require.True(t, env.IsWorkflowCompleted())
@@ -61,8 +82,7 @@ func TestWordflowLevelWorkflowCompletesThroughUpdates(t *testing.T) {
 func TestRejectedWordsAreDurableAndNewestFirst(t *testing.T) {
 	puzzle := testPuzzle(t, 1)
 
-	suite := testsuite.WorkflowTestSuite{}
-	env := suite.NewTestWorkflowEnvironment()
+	env := newLevelTestEnv(t, puzzle)
 	var latest game.GameView
 
 	for index, word := range []string{"LOW", "FOR", "ZZZ"} {
@@ -86,7 +106,7 @@ func TestRejectedWordsAreDurableAndNewestFirst(t *testing.T) {
 	}
 
 	env.ExecuteWorkflow(WordflowLevelWorkflow, WordflowLevelWorkflowInput{
-		PlayerID: "test-player", CampaignID: "test-campaign", Puzzle: puzzle,
+		PlayerID: "test-player", CampaignID: "test-campaign", Level: puzzle.Level,
 	})
 
 	require.NoError(t, env.GetWorkflowError())
@@ -140,10 +160,9 @@ func TestWordflowLevelWorkflowEndsWhenHardLimitExpires(t *testing.T) {
 	puzzle := testPuzzle(t, 1)
 	puzzle.TimeLimitSeconds = 60
 
-	suite := testsuite.WorkflowTestSuite{}
-	env := suite.NewTestWorkflowEnvironment()
+	env := newLevelTestEnv(t, puzzle)
 	env.ExecuteWorkflow(WordflowLevelWorkflow, WordflowLevelWorkflowInput{
-		PlayerID: "test-player", CampaignID: "daily", Puzzle: puzzle,
+		PlayerID: "test-player", CampaignID: "daily", Level: puzzle.Level,
 	})
 
 	require.True(t, env.IsWorkflowCompleted())
@@ -280,17 +299,9 @@ func TestPaidHintSpendsPointsThroughActivity(t *testing.T) {
 	puzzle.HintPrices.Letter = 15
 	gameID := WordflowLevelWorkflowID("test-player", "test-campaign", puzzle.Level)
 
-	suite := testsuite.WorkflowTestSuite{}
-	env := suite.NewTestWorkflowEnvironment()
-	env.RegisterActivityWithOptions(testSpendPointsActivity, activity.RegisterOptions{Name: ActivitySpendPoints})
+	env := newLevelTestEnv(t, puzzle)
 	env.OnActivity(ActivitySpendPoints, mock.Anything, SpendPointsActivityInput{
-		PlayerWorkflowID: PlayerWorkflowID("test-player"),
-		UpdateID:         "spend/" + gameID + "/buy-letter",
-		Spend: SpendPointsInput{
-			LevelWorkflowID: gameID,
-			Amount:          15,
-			Reason:          "wordflow/letter-hint",
-		},
+		PlayerID: "test-player", LevelWorkflowID: gameID, Amount: 15,
 	}).Return(SpendPointsResult{Spent: 15, Remaining: 40}, nil).Once()
 
 	var hintResult game.HintResult
@@ -323,4 +334,66 @@ func TestPaidHintSpendsPointsThroughActivity(t *testing.T) {
 	require.NotNil(t, hintResult.PointsRemaining)
 	require.Equal(t, 40, *hintResult.PointsRemaining)
 	env.AssertExpectations(t)
+}
+
+func TestRefusedClaimEndsTheLevelWithoutARecordedResult(t *testing.T) {
+	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
+	env.RegisterActivityWithOptions(func(context.Context, ClaimLevelActivityInput) (ClaimLevelResult, error) {
+		return ClaimLevelResult{}, temporal.NewNonRetryableApplicationError("level 2 is not next", "level_not_next", nil)
+	}, activity.RegisterOptions{Name: ActivityClaimLevel})
+	var refusal error
+	env.RegisterDelayedCallback(func() {
+		env.UpdateWorkflow(UpdateStartLevel, "start", &testsuite.TestUpdateCallback{
+			OnReject:   func(err error) { require.NoError(t, err) },
+			OnComplete: func(_ any, err error) { refusal = err },
+		}, StartLevelInput{})
+	}, 0)
+
+	env.ExecuteWorkflow(WordflowLevelWorkflow, WordflowLevelWorkflowInput{PlayerID: "p", CampaignID: "c", Level: 2})
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	require.ErrorContains(t, refusal, "level 2 is not next")
+}
+
+func TestUntimedLevelIsAbandonedAfterADayWithoutAMove(t *testing.T) {
+	puzzle := testPuzzle(t, 1)
+	env := newLevelTestEnv(t, puzzle)
+	var recorded RecordLevelResultActivityInput
+	env.OnActivity(ActivityRecordLevelResult, mock.Anything, mock.Anything).
+		Run(func(arguments mock.Arguments) { recorded = arguments.Get(1).(RecordLevelResultActivityInput) }).
+		Return(nil).Once()
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: WordflowLevelWorkflowID("p", "c", 1)})
+	startedAt := env.Now()
+	// A guess 20 hours in pushes the expiry to 44 hours.
+	env.RegisterDelayedCallback(func() {
+		env.UpdateWorkflow(UpdateSubmitGuess, "guess", &testsuite.TestUpdateCallback{
+			OnComplete: func(_ any, err error) { require.NoError(t, err) },
+		}, SubmitGuessInput{Word: puzzle.Words[0].Answer})
+	}, 20*time.Hour)
+
+	env.ExecuteWorkflow(WordflowLevelWorkflow, WordflowLevelWorkflowInput{PlayerID: "p", CampaignID: "c", Level: 1})
+
+	require.NoError(t, env.GetWorkflowError())
+	var result campaign.LevelResult
+	require.NoError(t, env.GetWorkflowResult(&result))
+	require.True(t, result.Abandoned)
+	require.Empty(t, result.Awards)
+	require.False(t, result.CompletedAt.Before(startedAt.Add(44*time.Hour)), "the idle limit counts from the last move")
+	require.Equal(t, result, recorded.Result)
+	require.Equal(t, "p", recorded.PlayerID)
+	require.Equal(t, WordflowLevelWorkflowID("p", "c", 1), recorded.LevelWorkflowID)
+}
+
+func TestTimedLevelIsNotAbandonedWhileItsClockRuns(t *testing.T) {
+	puzzle := testPuzzle(t, 1)
+	puzzle.TimeLimitSeconds = 180
+	env := newLevelTestEnv(t, puzzle)
+
+	env.ExecuteWorkflow(WordflowLevelWorkflow, WordflowLevelWorkflowInput{PlayerID: "p", CampaignID: "c", Level: 1})
+
+	var result campaign.LevelResult
+	require.NoError(t, env.GetWorkflowResult(&result))
+	require.True(t, result.TimedOut)
+	require.False(t, result.Abandoned)
 }

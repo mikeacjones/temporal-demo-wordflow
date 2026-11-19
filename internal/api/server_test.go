@@ -6,17 +6,20 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/mjones/temporal-word-game/internal/campaign"
+	"github.com/mjones/temporal-word-game/internal/catalog"
 	"github.com/mjones/temporal-word-game/internal/game"
+	"github.com/mjones/temporal-word-game/internal/player"
+	"github.com/mjones/temporal-word-game/internal/store"
 	"github.com/mjones/temporal-word-game/internal/workflows"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/api/enums/v1"
-	querypb "go.temporal.io/api/query/v1"
-	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 	temporalmocks "go.temporal.io/sdk/mocks"
 	"go.temporal.io/sdk/temporal"
@@ -44,7 +47,7 @@ func TestWorkflowExplorerURLWithoutRunID(t *testing.T) {
 
 func TestIndexWithoutSessionRendersLoginImmediately(t *testing.T) {
 	temporalClient := temporalmocks.NewClient(t)
-	handler := New(temporalClient, "test-task-queue", "default",
+	handler := New(temporalClient, newMemoryStore(), "test-task-queue", "default",
 		"a-test-session-secret-with-at-least-32-characters")
 	request := httptest.NewRequest("GET", "/", nil)
 	request.Header.Set("X-Forwarded-Proto", "https")
@@ -81,8 +84,7 @@ func TestSignupRequiresMatchingPasswordConfirmation(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			temporalClient := temporalmocks.NewClient(t)
-			server := &Server{temporal: temporalClient}
+			server := &Server{temporal: temporalmocks.NewClient(t), store: newMemoryStore()}
 			request := httptest.NewRequest("POST", "/api/signup", bytes.NewBufferString(test.body))
 			response := httptest.NewRecorder()
 
@@ -96,7 +98,7 @@ func TestSignupRequiresMatchingPasswordConfirmation(t *testing.T) {
 
 func TestSocialPreviewImageIsPublic(t *testing.T) {
 	temporalClient := temporalmocks.NewClient(t)
-	handler := New(temporalClient, "test-task-queue", "default",
+	handler := New(temporalClient, newMemoryStore(), "test-task-queue", "default",
 		"a-test-session-secret-with-at-least-32-characters")
 	request := httptest.NewRequest("GET", "/social-preview.png", nil)
 	response := httptest.NewRecorder()
@@ -111,7 +113,7 @@ func TestSocialPreviewImageIsPublic(t *testing.T) {
 
 func TestWorkflowExplorerIsMountedInWebApp(t *testing.T) {
 	temporalClient := temporalmocks.NewClient(t)
-	handler := New(temporalClient, "test-task-queue", "default",
+	handler := New(temporalClient, newMemoryStore(), "test-task-queue", "default",
 		"a-test-session-secret-with-at-least-32-characters")
 	request := httptest.NewRequest("GET", "/workflows/", nil)
 	response := httptest.NewRecorder()
@@ -125,30 +127,13 @@ func TestWorkflowExplorerIsMountedInWebApp(t *testing.T) {
 	require.Contains(t, response.Body.String(), `id="show-worker-events" type="checkbox" checked`)
 }
 
-func TestWorkflowLinkRedirectDoesNotDescribeWorkflow(t *testing.T) {
-	secret := []byte("a-test-session-secret-with-at-least-32-characters")
-	now := time.Now()
-	token, err := newSessionToken(secret, "alice", now, now.Add(time.Hour))
-	require.NoError(t, err)
-	temporalClient := temporalmocks.NewClient(t)
-	handler := New(temporalClient, "test-task-queue", "wordflow.test", string(secret))
-	request := httptest.NewRequest("GET", "/api/me/workflow-link", nil)
-	request.Header.Set("Cookie", sessionCookieName+"="+token)
-	response := httptest.NewRecorder()
-
-	handler.ServeHTTP(response, request)
-
-	require.Equal(t, 302, response.Code)
-	require.Equal(t, "/workflows/?workflowId=player%2Falice", response.Header().Get("Location"))
-}
-
 func TestIndexWithExpiredSessionRendersLoginImmediately(t *testing.T) {
 	secret := []byte("a-test-session-secret-with-at-least-32-characters")
 	now := time.Now()
 	token, err := newSessionToken(secret, "alice", now.Add(-2*time.Hour), now.Add(-time.Hour))
 	require.NoError(t, err)
 	temporalClient := temporalmocks.NewClient(t)
-	handler := New(temporalClient, "test-task-queue", "default", string(secret))
+	handler := New(temporalClient, newMemoryStore(), "test-task-queue", "default", string(secret))
 	request := httptest.NewRequest("GET", "/", nil)
 	request.Header.Set("Cookie", sessionCookieName+"="+token)
 	response := httptest.NewRecorder()
@@ -165,7 +150,7 @@ func TestIndexWithValidSessionStartsOnNeutralLoadingScreen(t *testing.T) {
 	token, err := newSessionToken(secret, "alice", now, now.Add(time.Hour))
 	require.NoError(t, err)
 	temporalClient := temporalmocks.NewClient(t)
-	handler := New(temporalClient, "test-task-queue", "default", string(secret))
+	handler := New(temporalClient, newMemoryStore(), "test-task-queue", "default", string(secret))
 	request := httptest.NewRequest("GET", "/", nil)
 	request.Header.Set("Cookie", sessionCookieName+"="+token)
 	response := httptest.NewRecorder()
@@ -174,50 +159,6 @@ func TestIndexWithValidSessionStartsOnNeutralLoadingScreen(t *testing.T) {
 
 	require.Equal(t, 200, response.Code)
 	require.Contains(t, response.Body.String(), `data-session="authenticated"`)
-}
-
-func TestLoginCredentialFailuresAreIndistinguishable(t *testing.T) {
-	tests := []struct {
-		name  string
-		setup func(*testing.T, *temporalmocks.Client)
-	}{
-		{
-			name: "unknown username",
-			setup: func(_ *testing.T, temporalClient *temporalmocks.Client) {
-				temporalClient.On("UpdateWorkflow", mock.Anything, mock.Anything).
-					Return(nil, serviceerror.NewNotFound("player workflow not found")).Once()
-			},
-		},
-		{
-			name: "wrong password",
-			setup: func(t *testing.T, temporalClient *temporalmocks.Client) {
-				handle := temporalmocks.NewWorkflowUpdateHandle(t)
-				handle.On("Get", mock.Anything, mock.Anything).
-					Return(temporal.NewApplicationError("invalid username or password", "invalid_credentials")).Once()
-				temporalClient.On("UpdateWorkflow", mock.Anything, mock.Anything).Return(handle, nil).Once()
-			},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			temporalClient := temporalmocks.NewClient(t)
-			test.setup(t, temporalClient)
-			server := &Server{
-				temporal:         temporalClient,
-				sessionJWTSecret: []byte("a-test-session-secret-with-at-least-32-characters"),
-			}
-			request := httptest.NewRequest("POST", "/api/login", bytes.NewBufferString(
-				`{"username":"alice","password":"wrong-password","requestId":"login-test"}`,
-			))
-			response := httptest.NewRecorder()
-
-			server.logIn(response, request)
-
-			require.Equal(t, 401, response.Code)
-			require.JSONEq(t, `{"error":"Invalid username/password combination"}`, response.Body.String())
-		})
-	}
 }
 
 func TestPlayerResponseContainsOnlyBrowserFields(t *testing.T) {
@@ -288,210 +229,6 @@ func TestGameResponseOmitsWorkflowStateNotRenderedByBrowser(t *testing.T) {
 	}
 }
 
-func TestCatalogReadsExistingWorkflowWithQuery(t *testing.T) {
-	result := temporalmocks.NewEncodedValue(t)
-	result.On("Get", mock.Anything).Run(func(arguments mock.Arguments) {
-		view := arguments.Get(0).(*campaign.CatalogView)
-		*view = campaign.CatalogView{Campaigns: []campaign.View{{
-			CampaignID: "campaign", WorkflowID: "wordflow-campaign/campaign", Title: "Campaign",
-		}}}
-	}).Return(nil).Once()
-
-	temporalClient := temporalmocks.NewClient(t)
-	temporalClient.On("QueryWorkflowWithOptions", mock.Anything,
-		mock.MatchedBy(func(request *client.QueryWorkflowWithOptionsRequest) bool {
-			return request.WorkflowID == workflows.CatalogWorkflowID &&
-				request.QueryType == workflows.QueryCatalog &&
-				request.QueryRejectCondition == enums.QUERY_REJECT_CONDITION_NOT_OPEN &&
-				len(request.Args) == 1
-		})).Return(&client.QueryWorkflowWithOptionsResponse{QueryResult: result}, nil).Once()
-	server := &Server{temporal: temporalClient}
-
-	response, err := server.catalog(context.Background(), game.PlayerView{})
-	require.NoError(t, err)
-	require.Len(t, response.Campaigns, 1)
-	require.Equal(t, "Campaign", response.Campaigns[0].Title)
-	require.Equal(t, "/workflows/?workflowId=wordflow-campaign%2Fcampaign", response.Campaigns[0].WorkflowURL)
-}
-
-func TestCatalogStartsFreshAfterPreviousWorkflowWasTerminated(t *testing.T) {
-	result := temporalmocks.NewEncodedValue(t)
-	result.On("Get", mock.Anything).Run(func(arguments mock.Arguments) {
-		view := arguments.Get(0).(*campaign.CatalogView)
-		*view = campaign.CatalogView{Campaigns: []campaign.View{}}
-	}).Return(nil).Once()
-
-	queryRequest := mock.MatchedBy(func(request *client.QueryWorkflowWithOptionsRequest) bool {
-		return request.WorkflowID == workflows.CatalogWorkflowID &&
-			request.QueryType == workflows.QueryCatalog &&
-			request.QueryRejectCondition == enums.QUERY_REJECT_CONDITION_NOT_OPEN
-	})
-	handle := temporalmocks.NewWorkflowUpdateHandle(t)
-	handle.On("Get", mock.Anything, mock.Anything).Run(func(arguments mock.Arguments) {
-		*arguments.Get(1).(*int) = 1
-	}).Return(nil).Once()
-	temporalClient := temporalmocks.NewClient(t)
-	temporalClient.On("QueryWorkflowWithOptions", mock.Anything, queryRequest).
-		Return(&client.QueryWorkflowWithOptionsResponse{
-			QueryRejected: &querypb.QueryRejected{Status: enums.WORKFLOW_EXECUTION_STATUS_TERMINATED},
-		}, nil).Once()
-	temporalClient.On("ExecuteWorkflow", mock.Anything, mock.MatchedBy(func(options client.StartWorkflowOptions) bool {
-		return options.ID == workflows.WordflowCampaignWorkflowID("temporal-foundations") &&
-			options.TaskQueue == "wordflow" &&
-			options.WorkflowIDReusePolicy == enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY
-	}), workflows.WordflowCampaignWorkflowName, mock.Anything).
-		Return((client.WorkflowRun)(nil), nil).Once()
-	temporalClient.On("NewWithStartWorkflowOperation", mock.MatchedBy(func(options client.StartWorkflowOptions) bool {
-		return options.ID == workflows.CatalogWorkflowID && options.TaskQueue == "wordflow" &&
-			options.WorkflowIDReusePolicy == enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY
-	}), workflows.CatalogWorkflowName, mock.Anything).
-		Return((client.WithStartWorkflowOperation)(nil)).Once()
-	temporalClient.On("UpdateWithStartWorkflow", mock.Anything,
-		mock.MatchedBy(func(options client.UpdateWithStartWorkflowOptions) bool {
-			return options.UpdateOptions.UpdateName == workflows.UpdateOpenCatalog
-		})).Return(handle, nil).Once()
-	temporalClient.On("QueryWorkflowWithOptions", mock.Anything, queryRequest).
-		Return(&client.QueryWorkflowWithOptionsResponse{QueryResult: result}, nil).Once()
-	server := &Server{temporal: temporalClient, taskQueue: "wordflow"}
-
-	response, err := server.catalog(context.Background(), game.PlayerView{})
-
-	require.NoError(t, err)
-	require.Empty(t, response.Campaigns)
-}
-
-func TestStartGameUsesThePlayerUpdateResultWithoutQueryingTheChild(t *testing.T) {
-	secret := []byte("a-test-session-secret-with-at-least-32-characters")
-	now := time.Now()
-	token, err := newSessionToken(secret, "alice", now, now.Add(time.Hour))
-	require.NoError(t, err)
-
-	handle := temporalmocks.NewWorkflowUpdateHandle(t)
-	handle.On("Get", mock.Anything, mock.Anything).Run(func(arguments mock.Arguments) {
-		result := arguments.Get(1).(*workflows.StartLevelResult)
-		*result = workflows.StartLevelResult{
-			Player: game.PlayerView{DisplayName: "Alice", ActiveGame: &game.ActiveGame{
-				CampaignID: "campaign", Level: 1,
-			}},
-			Game: game.GameView{CampaignID: "campaign", Level: 1, Title: "One", Letters: "ONE"},
-		}
-	}).Return(nil).Once()
-	temporalClient := temporalmocks.NewClient(t)
-	temporalClient.On("UpdateWorkflow", mock.Anything, mock.MatchedBy(func(options client.UpdateWorkflowOptions) bool {
-		return options.WorkflowID == workflows.PlayerWorkflowID("alice") &&
-			options.UpdateName == workflows.UpdateStartLevel
-	})).Return(handle, nil).Once()
-
-	request := httptest.NewRequest("POST", "/api/me/campaigns/campaign/levels",
-		bytes.NewBufferString(`{"requestId":"start-test","level":1}`))
-	request.SetPathValue("campaign", "campaign")
-	request.Header.Set("Cookie", sessionCookieName+"="+token)
-	response := httptest.NewRecorder()
-	server := &Server{temporal: temporalClient, sessionJWTSecret: secret}
-
-	server.startGame(response, request)
-
-	require.Equal(t, 200, response.Code)
-	require.JSONEq(t, `{
-		"player":{"displayName":"Alice","currentStreak":0,"bestStreak":0,"points":0,
-			"lifetimePointsEarned":0,"streakFreeze":false,"streakFreezeCost":0,
-			"completedLevelCount":0,"activeGame":{"campaignId":"campaign","level":1}},
-		"game":{"campaignId":"campaign","level":1,"title":"One","letters":"ONE","cells":null,
-			"foundWords":0,"totalWords":0,"attempts":0,"rejectedWords":null,"speedBonuses":null,
-			"hintBonus":0,"accuracyBonus":0,"hints":{"letters":0,"brushes":0,"words":0},
-			"hintPrices":{"letter":0,"brush":0,"word":0},"complete":false}
-	}`, response.Body.String())
-}
-
-func TestAuthenticatedPlayerRejectsClosedPlayerWorkflow(t *testing.T) {
-	secret := []byte("a-test-session-secret-with-at-least-32-characters")
-	now := time.Now()
-	token, err := newSessionToken(secret, "alice", now, now.Add(time.Hour))
-	require.NoError(t, err)
-
-	temporalClient := temporalmocks.NewClient(t)
-	temporalClient.On("QueryWorkflowWithOptions", mock.Anything, mock.MatchedBy(func(request *client.QueryWorkflowWithOptionsRequest) bool {
-		return request.WorkflowID == workflows.PlayerWorkflowID("alice") &&
-			request.QueryType == workflows.QueryPlayerState &&
-			request.QueryRejectCondition == enums.QUERY_REJECT_CONDITION_NOT_OPEN
-	})).Return(&client.QueryWorkflowWithOptionsResponse{
-		QueryRejected: &querypb.QueryRejected{Status: enums.WORKFLOW_EXECUTION_STATUS_TERMINATED},
-	}, nil).Once()
-
-	request := httptest.NewRequest("GET", "/api/session", nil)
-	request.Header.Set("Cookie", "wordflow_session="+token)
-	server := &Server{temporal: temporalClient, sessionJWTSecret: secret}
-
-	response := httptest.NewRecorder()
-	server.openSession(response, request)
-	require.Equal(t, 401, response.Code)
-	require.Contains(t, response.Body.String(), "session is invalid or expired")
-}
-
-func TestAuthenticatedPlayerAcceptsOpenPlayerWorkflow(t *testing.T) {
-	secret := []byte("a-test-session-secret-with-at-least-32-characters")
-	now := time.Now()
-	token, err := newSessionToken(secret, "alice", now, now.Add(time.Hour))
-	require.NoError(t, err)
-
-	result := temporalmocks.NewEncodedValue(t)
-	result.On("Get", mock.Anything).Run(func(arguments mock.Arguments) {
-		player := arguments.Get(0).(*game.PlayerView)
-		*player = game.PlayerView{DisplayName: "Alice"}
-	}).Return(nil).Once()
-	temporalClient := temporalmocks.NewClient(t)
-	temporalClient.On("QueryWorkflowWithOptions", mock.Anything, mock.MatchedBy(func(request *client.QueryWorkflowWithOptionsRequest) bool {
-		return request.WorkflowID == workflows.PlayerWorkflowID("alice") &&
-			request.QueryType == workflows.QueryPlayerState &&
-			request.QueryRejectCondition == enums.QUERY_REJECT_CONDITION_NOT_OPEN
-	})).
-		Return(&client.QueryWorkflowWithOptionsResponse{QueryResult: result}, nil).Once()
-
-	request := httptest.NewRequest("GET", "/api/session", nil)
-	request.Header.Set("Cookie", "wordflow_session="+token)
-	server := &Server{temporal: temporalClient, sessionJWTSecret: secret}
-
-	player, err := server.authenticatedPlayer(request)
-	require.NoError(t, err)
-	require.Equal(t, "Alice", player.DisplayName)
-}
-
-func TestLeaderboardStartsFreshAfterPreviousWorkflowWasTerminated(t *testing.T) {
-	result := temporalmocks.NewEncodedValue(t)
-	result.On("Get", mock.Anything).Run(func(arguments mock.Arguments) {
-		view := arguments.Get(0).(*game.LeaderboardView)
-		*view = game.LeaderboardView{Entries: []game.LeaderboardRank{}}
-	}).Return(nil).Once()
-
-	temporalClient := temporalmocks.NewClient(t)
-	queryRequest := mock.MatchedBy(func(request *client.QueryWorkflowWithOptionsRequest) bool {
-		return request.WorkflowID == workflows.LeaderboardWorkflowID &&
-			request.QueryType == workflows.QueryLeaderboard &&
-			request.QueryRejectCondition == enums.QUERY_REJECT_CONDITION_NOT_OPEN
-	})
-	temporalClient.On("QueryWorkflowWithOptions", mock.Anything, queryRequest).
-		Return(&client.QueryWorkflowWithOptionsResponse{
-			QueryRejected: &querypb.QueryRejected{Status: enums.WORKFLOW_EXECUTION_STATUS_TERMINATED},
-		}, nil).Once()
-	temporalClient.On("ExecuteWorkflow", mock.Anything, mock.MatchedBy(func(options client.StartWorkflowOptions) bool {
-		return options.ID == workflows.LeaderboardWorkflowID &&
-			options.WorkflowIDConflictPolicy == enums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING &&
-			options.WorkflowIDReusePolicy == enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY
-	}), workflows.LeaderboardWorkflowName, workflows.LeaderboardWorkflowInput{}).
-		Return((client.WorkflowRun)(nil), nil).Once()
-	temporalClient.On("QueryWorkflowWithOptions", mock.Anything, queryRequest).
-		Return(&client.QueryWorkflowWithOptionsResponse{QueryResult: result}, nil).Once()
-
-	request := httptest.NewRequest("GET", "/api/leaderboard", nil)
-	response := httptest.NewRecorder()
-	server := &Server{temporal: temporalClient, taskQueue: "wordflow"}
-
-	server.getLeaderboard(response, request)
-
-	require.Equal(t, 200, response.Code)
-	require.JSONEq(t, `{"entries":[]}`, response.Body.String())
-}
-
 func jsonObject(t *testing.T, value any) map[string]json.RawMessage {
 	t.Helper()
 	encoded, err := json.Marshal(value)
@@ -503,4 +240,267 @@ func jsonObject(t *testing.T, value any) map[string]json.RawMessage {
 		t.Fatal(err)
 	}
 	return object
+}
+
+// memoryStore is the Store in memory, for handler tests.
+type memoryStore struct {
+	mu        sync.Mutex
+	players   map[string]player.State
+	campaigns []catalog.Registration
+}
+
+func newMemoryStore() *memoryStore {
+	return &memoryStore{players: map[string]player.State{}}
+}
+
+func (m *memoryStore) CreatePlayer(_ context.Context, state player.State) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.players[state.PlayerID]; ok {
+		return store.ErrExists
+	}
+	m.players[state.PlayerID] = state
+	return nil
+}
+
+func (m *memoryStore) Player(_ context.Context, playerID string) (player.State, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state, ok := m.players[playerID]
+	if !ok {
+		return player.State{}, store.ErrNotFound
+	}
+	return state, nil
+}
+
+func (m *memoryStore) UpdatePlayer(_ context.Context, playerID string, change func(*player.State) error) (player.State, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state, ok := m.players[playerID]
+	if !ok {
+		return player.State{}, store.ErrNotFound
+	}
+	if err := change(&state); err != nil {
+		return player.State{}, err
+	}
+	m.players[playerID] = state
+	return state, nil
+}
+
+func (m *memoryStore) Campaigns(context.Context) ([]catalog.Registration, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]catalog.Registration(nil), m.campaigns...), nil
+}
+
+func (m *memoryStore) Leaderboard(_ context.Context, limit int) ([]game.LeaderboardRank, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var ranks []game.LeaderboardRank
+	for _, state := range m.players {
+		if state.LifetimePointsEarned > 0 {
+			ranks = append(ranks, game.LeaderboardRank{DisplayName: state.DisplayName, LifetimePointsEarned: state.LifetimePointsEarned})
+		}
+	}
+	sort.Slice(ranks, func(i, j int) bool { return ranks[i].LifetimePointsEarned > ranks[j].LifetimePointsEarned })
+	if len(ranks) > limit {
+		ranks = ranks[:limit]
+	}
+	for index := range ranks {
+		ranks[index].Rank = index + 1
+	}
+	return ranks, nil
+}
+
+const testSecret = "a-test-session-secret-with-at-least-32-characters"
+
+func signedInRequest(t *testing.T, method, target, body, playerID string) *http.Request {
+	t.Helper()
+	now := time.Now()
+	token, err := newSessionToken([]byte(testSecret), playerID, now, now.Add(time.Hour))
+	require.NoError(t, err)
+	request := httptest.NewRequest(method, target, bytes.NewBufferString(body))
+	request.Header.Set("Cookie", sessionCookieName+"="+token)
+	return request
+}
+
+func TestSignUpThenLogInWithTheSamePassword(t *testing.T) {
+	data := newMemoryStore()
+	handler := New(temporalmocks.NewClient(t), data, "test-task-queue", "default", testSecret)
+
+	signUp := httptest.NewRecorder()
+	handler.ServeHTTP(signUp, httptest.NewRequest("POST", "/api/signup", bytes.NewBufferString(
+		`{"username":"Alice","displayName":"Alice","password":"password123","passwordConfirmation":"password123"}`)))
+	require.Equal(t, http.StatusCreated, signUp.Code, signUp.Body.String())
+	require.Contains(t, signUp.Header().Get("Set-Cookie"), sessionCookieName+"=")
+	stored, err := data.Player(context.Background(), "alice")
+	require.NoError(t, err)
+	require.NotEmpty(t, stored.PasswordHash)
+	require.NotContains(t, signUp.Body.String(), stored.PasswordHash)
+
+	retry := httptest.NewRecorder()
+	handler.ServeHTTP(retry, httptest.NewRequest("POST", "/api/signup", bytes.NewBufferString(
+		`{"username":"alice","displayName":"Alice","password":"password123","passwordConfirmation":"password123"}`)))
+	require.Equal(t, http.StatusCreated, retry.Code, "a retried sign-up signs in")
+
+	taken := httptest.NewRecorder()
+	handler.ServeHTTP(taken, httptest.NewRequest("POST", "/api/signup", bytes.NewBufferString(
+		`{"username":"alice","displayName":"Mallory","password":"different1","passwordConfirmation":"different1"}`)))
+	require.Equal(t, http.StatusConflict, taken.Code)
+
+	logIn := httptest.NewRecorder()
+	handler.ServeHTTP(logIn, httptest.NewRequest("POST", "/api/login", bytes.NewBufferString(
+		`{"username":"alice","password":"password123"}`)))
+	require.Equal(t, http.StatusOK, logIn.Code, logIn.Body.String())
+}
+
+func TestLoginCredentialFailuresAreIndistinguishable(t *testing.T) {
+	data := newMemoryStore()
+	hash, err := passwordHash("alice", "password123")
+	require.NoError(t, err)
+	require.NoError(t, data.CreatePlayer(context.Background(), player.New("alice", "Alice#1", hash, time.Now())))
+	server := &Server{temporal: temporalmocks.NewClient(t), store: data, sessionJWTSecret: []byte(testSecret)}
+
+	for name, body := range map[string]string{
+		"unknown username": `{"username":"bob","password":"password123"}`,
+		"wrong password":   `{"username":"alice","password":"wrong-password"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			server.logIn(response, httptest.NewRequest("POST", "/api/login", bytes.NewBufferString(body)))
+
+			require.Equal(t, 401, response.Code)
+			require.JSONEq(t, `{"error":"Invalid username/password combination"}`, response.Body.String())
+		})
+	}
+}
+
+func TestCatalogComesFromTheStoreWithThePlayersProgress(t *testing.T) {
+	data := newMemoryStore()
+	data.campaigns = []catalog.Registration{{
+		WorkflowID: "wordflow-campaign/campaign",
+		Definition: campaign.Definition{
+			ID: "campaign", Title: "Campaign", Unlock: campaign.UnlockPolicy{InitialLevels: 2},
+			Game: campaign.GameSummary{ID: campaign.GameWordflow, Title: "Wordflow"},
+		},
+		Levels: []game.Puzzle{{Level: 1, Title: "One"}, {Level: 2, Title: "Two"}},
+	}}
+	account := player.New("alice", "Alice#1", "hash", time.Now())
+	account.Campaigns = []campaign.PlayerCampaignProgress{{CampaignID: "campaign", JoinedAt: time.Now(), NextLevel: 2, CompletedLevels: 1}}
+	server := &Server{store: data}
+
+	response, err := server.catalog(context.Background(), account)
+
+	require.NoError(t, err)
+	require.Len(t, response.Campaigns, 1)
+	card := response.Campaigns[0]
+	require.Equal(t, "Campaign", card.Title)
+	require.Equal(t, "/workflows/?workflowId=wordflow-campaign%2Fcampaign", card.WorkflowURL)
+	require.Equal(t, 2, card.NextLevel)
+	require.Equal(t, campaign.LevelComplete, card.Levels[0].Status)
+	require.Equal(t, campaign.LevelAvailable, card.Levels[1].Status)
+}
+
+func TestStartGameIsOneUpdateWithStartOfTheLevelWorkflow(t *testing.T) {
+	handle := temporalmocks.NewWorkflowUpdateHandle(t)
+	handle.On("Get", mock.Anything, mock.Anything).Run(func(arguments mock.Arguments) {
+		*arguments.Get(1).(*workflows.StartLevelResult) = workflows.StartLevelResult{
+			Player: game.PlayerView{DisplayName: "Alice", ActiveGame: &game.ActiveGame{CampaignID: "campaign", Level: 1}},
+			Game:   game.GameView{CampaignID: "campaign", Level: 1, Title: "One", Letters: "ONE"},
+		}
+	}).Return(nil).Once()
+	levelID := workflows.WordflowLevelWorkflowID("alice", "campaign", 1)
+	temporalClient := temporalmocks.NewClient(t)
+	temporalClient.On("NewWithStartWorkflowOperation", mock.MatchedBy(func(options client.StartWorkflowOptions) bool {
+		return options.ID == levelID && options.TaskQueue == "wordflow" &&
+			options.WorkflowIDConflictPolicy == enums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING
+	}), workflows.WordflowLevelWorkflowName, workflows.WordflowLevelWorkflowInput{
+		PlayerID: "alice", CampaignID: "campaign", Level: 1,
+	}).Return((client.WithStartWorkflowOperation)(nil)).Once()
+	temporalClient.On("UpdateWithStartWorkflow", mock.Anything, mock.MatchedBy(func(options client.UpdateWithStartWorkflowOptions) bool {
+		return options.UpdateOptions.UpdateName == workflows.UpdateStartLevel &&
+			options.UpdateOptions.UpdateID == "start-test" &&
+			options.UpdateOptions.WaitForStage == client.WorkflowUpdateStageCompleted
+	})).Return(handle, nil).Once()
+
+	request := signedInRequest(t, "POST", "/api/me/campaigns/campaign/levels", `{"requestId":"start-test","level":1}`, "alice")
+	request.SetPathValue("campaign", "campaign")
+	response := httptest.NewRecorder()
+	server := &Server{temporal: temporalClient, store: newMemoryStore(), taskQueue: "wordflow", sessionJWTSecret: []byte(testSecret)}
+
+	server.startGame(response, request)
+
+	require.Equal(t, 200, response.Code, response.Body.String())
+	require.JSONEq(t, `{
+		"player":{"displayName":"Alice","currentStreak":0,"bestStreak":0,"points":0,
+			"lifetimePointsEarned":0,"streakFreeze":false,"streakFreezeCost":0,
+			"completedLevelCount":0,"activeGame":{"campaignId":"campaign","level":1}},
+		"game":{"campaignId":"campaign","level":1,"title":"One","letters":"ONE","cells":null,
+			"foundWords":0,"totalWords":0,"attempts":0,"rejectedWords":null,"speedBonuses":null,
+			"hintBonus":0,"accuracyBonus":0,"hints":{"letters":0,"brushes":0,"words":0},
+			"hintPrices":{"letter":0,"brush":0,"word":0},"complete":false}
+	}`, response.Body.String())
+}
+
+func TestStartGameReportsARefusedClaimAsAConflict(t *testing.T) {
+	handle := temporalmocks.NewWorkflowUpdateHandle(t)
+	handle.On("Get", mock.Anything, mock.Anything).
+		Return(temporal.NewApplicationError("level 2 is not next; expected level 1", "level_not_next")).Once()
+	temporalClient := temporalmocks.NewClient(t)
+	temporalClient.On("NewWithStartWorkflowOperation", mock.Anything, mock.Anything, mock.Anything).
+		Return((client.WithStartWorkflowOperation)(nil)).Once()
+	temporalClient.On("UpdateWithStartWorkflow", mock.Anything, mock.Anything).Return(handle, nil).Once()
+	request := signedInRequest(t, "POST", "/api/me/campaigns/campaign/levels", `{"level":2}`, "alice")
+	request.SetPathValue("campaign", "campaign")
+	response := httptest.NewRecorder()
+	server := &Server{temporal: temporalClient, store: newMemoryStore(), sessionJWTSecret: []byte(testSecret)}
+
+	server.startGame(response, request)
+
+	require.Equal(t, http.StatusConflict, response.Code)
+	require.JSONEq(t, `{"error":"level 2 is not next; expected level 1"}`, response.Body.String())
+}
+
+func TestAuthenticatedPlayerNeedsAStoredAccount(t *testing.T) {
+	data := newMemoryStore()
+	require.NoError(t, data.CreatePlayer(context.Background(), player.New("alice", "Alice#1", "hash", time.Now())))
+	server := &Server{store: data, sessionJWTSecret: []byte(testSecret)}
+
+	account, err := server.authenticatedPlayer(signedInRequest(t, "GET", "/api/me", "", "alice"))
+	require.NoError(t, err)
+	require.Equal(t, "Alice#1", account.DisplayName)
+
+	_, err = server.authenticatedPlayer(signedInRequest(t, "GET", "/api/me", "", "bob"))
+	require.EqualError(t, err, "session is invalid or expired")
+}
+
+func TestBuyStreakFreezeRefusesWithoutEnoughPoints(t *testing.T) {
+	data := newMemoryStore()
+	require.NoError(t, data.CreatePlayer(context.Background(), player.New("alice", "Alice#1", "hash", time.Now())))
+	server := &Server{store: data, sessionJWTSecret: []byte(testSecret)}
+	response := httptest.NewRecorder()
+
+	server.buyStreakFreeze(response, signedInRequest(t, "POST", "/api/me/streak-freeze", `{"requestId":"r"}`, "alice"))
+
+	require.Equal(t, http.StatusConflict, response.Code)
+	require.Contains(t, response.Body.String(), "not enough points")
+}
+
+func TestLeaderboardComesFromTheStore(t *testing.T) {
+	data := newMemoryStore()
+	for name, points := range map[string]int{"alice": 40, "bob": 90, "carol": 0} {
+		account := player.New(name, name, "hash", time.Now())
+		account.LifetimePointsEarned = points
+		require.NoError(t, data.CreatePlayer(context.Background(), account))
+	}
+	server := &Server{store: data}
+	response := httptest.NewRecorder()
+
+	server.getLeaderboard(response, httptest.NewRequest("GET", "/api/leaderboard", nil))
+
+	require.Equal(t, 200, response.Code)
+	require.JSONEq(t, `{"entries":[
+		{"displayName":"bob","lifetimePointsEarned":90,"completedLevels":0,"rank":1},
+		{"displayName":"alice","lifetimePointsEarned":40,"completedLevels":0,"rank":2}
+	]}`, response.Body.String())
 }

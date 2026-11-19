@@ -206,14 +206,6 @@ type PlayerView struct {
 	ActiveGame           *ActiveGame                       `json:"activeGame,omitempty"`
 }
 
-type LeaderboardEntry struct {
-	PlayerID             string `json:"playerId"`
-	DisplayName          string `json:"displayName"`
-	LifetimePointsEarned int    `json:"lifetimePointsEarned"`
-	CompletedLevels      int    `json:"completedLevels"`
-	Version              int    `json:"version"`
-}
-
 type LeaderboardRank struct {
 	DisplayName          string `json:"displayName"`
 	LifetimePointsEarned int    `json:"lifetimePointsEarned"`

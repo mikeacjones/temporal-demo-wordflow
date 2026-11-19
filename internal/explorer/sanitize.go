@@ -430,7 +430,7 @@ func redactPuzzleField(name string) bool {
 func redactPublicIdentifier(name, value string) bool {
 	normalized := normalizeDetailKey(name)
 	return normalized == "playerid" || normalized == "username" ||
-		(normalized == "workflowid" && (strings.HasPrefix(value, "player/") || strings.HasPrefix(value, "wordflow-level/")))
+		(normalized == "workflowid" && strings.HasPrefix(value, "wordflow-level/"))
 }
 
 func normalizeDetailKey(value string) string {
