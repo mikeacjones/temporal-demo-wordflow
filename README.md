@@ -52,17 +52,24 @@ in the Temporal UI survives a restart.
 
 Each fire starts `WordflowCampaignGeneratorWorkflow` with the campaign kind. It
 runs an agent loop in which every model turn and every tool call is an Activity,
-so the Temporal UI shows the whole conversation. The model has three tools:
+so the Temporal UI shows the whole conversation. The model builds the campaign
+one level at a time in a draft that the Workflow keeps. It has four tools:
 
 | Tool | Does |
 | --- | --- |
-| `check_words` | Checks one level's letter bank and ten answers: letters, spelling, repeats, padding, answers used recently |
-| `check_level` | Does that and also builds the crossword layout, to confirm the answers connect |
-| `submit_campaign` | Submits the whole campaign for final validation; a pass ends the loop |
+| `suggest_anchors` | Lists common eight-letter anchor words that make good letter banks, putting those that share the fewest letters with saved levels first |
+| `find_words` | Lists every common word a letter bank can spell, without answers from recent campaigns, and names the saved level that already uses a word |
+| `set_level` | Checks one level and saves it to the draft if it passes: real common words, spellable from the bank, no repeats across levels, and a crossword that connects. It lists every problem at once |
+| `submit_campaign` | Takes the description, checks the whole draft again, and ends the loop if it passes |
 
-The model must call a tool on every turn and chooses when to check. A rejected
-check or submission goes back to the model as the tool's result, not as a
-failure, and the model corrects it and tries again. The run fails only when the
+Words come from two lists embedded in the Worker (see
+`internal/dictionary/data/README.md`). ENABLE decides whether a word is English;
+answers must also be in SCOWL size 50, so every answer is a word players know.
+
+The model must call a tool on every turn. Calls in one turn run one after
+another, so a level is checked against levels saved earlier in the same turn. A
+rejected level or submission goes back to the model as the tool's result, not as
+a failure, and the model corrects it and tries again. The run fails only when the
 model uses its turn budget (30 for a daily challenge, 40 for a monthly pack)
 without a valid submission. The Workflow logs each rejected submission and its
 reason. An accepted campaign starts as an abandoned child, and the Workflow

@@ -52,10 +52,23 @@ type CampaignRequest struct {
 
 // The tools the generating agent can call. Submitting is the only way to finish.
 const (
-	AgentToolCheckWords     = "check_words"
-	AgentToolCheckLevel     = "check_level"
+	AgentToolSuggestAnchors = "suggest_anchors"
+	AgentToolFindWords      = "find_words"
+	AgentToolSetLevel       = "set_level"
 	AgentToolSubmitCampaign = "submit_campaign"
 )
+
+// CampaignLevel is one level as the agent designs it, before the crossword is laid out.
+type CampaignLevel struct {
+	Title   string   `json:"title"`
+	Letters string   `json:"letters"`
+	Words   []string `json:"words"`
+}
+
+// CampaignDraft holds the levels that passed set_level, by level number. The
+// Workflow keeps it, so a saved level never has to be sent or checked again,
+// and each new level is checked against the others.
+type CampaignDraft map[int]CampaignLevel
 
 type AgentItemType string
 
@@ -92,15 +105,22 @@ type RunCampaignAgentTurnResult struct {
 
 type ExecuteCampaignToolInput struct {
 	Request CampaignRequest `json:"request"`
+	Draft   CampaignDraft   `json:"draft,omitempty"`
 	Call    AgentToolCall   `json:"call"`
 }
 
 // ExecuteCampaignToolResult always carries an Output for the agent, including
-// when a check or submission is rejected. Campaign is set only when a
-// submission passed full validation.
+// when a level or submission is rejected. SavedLevel is set when set_level
+// accepted a level, and Campaign only when a submission passed full validation.
 type ExecuteCampaignToolResult struct {
-	Output   string                         `json:"output"`
-	Campaign *WordflowCampaignWorkflowInput `json:"campaign,omitempty"`
+	Output     string                         `json:"output"`
+	SavedLevel *SavedCampaignLevel            `json:"savedLevel,omitempty"`
+	Campaign   *WordflowCampaignWorkflowInput `json:"campaign,omitempty"`
+}
+
+type SavedCampaignLevel struct {
+	Number int           `json:"number"`
+	Level  CampaignLevel `json:"level"`
 }
 
 // GeneratedCampaignID names the campaign a run of this kind creates for the
@@ -163,7 +183,8 @@ func WordflowCampaignGeneratorWorkflow(ctx workflow.Context, input CampaignGener
 }
 
 // runCampaignAgent loops model turns and tool calls until the agent submits a
-// campaign that passes full validation, or maxTurns turns have been used.
+// campaign that passes full validation, or maxTurns turns have been used. The
+// agent builds the campaign one level at a time in a draft the Workflow keeps.
 func runCampaignAgent(ctx workflow.Context, request CampaignRequest, maxTurns int) (WordflowCampaignWorkflowInput, error) {
 	modelCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: 2 * time.Minute,
@@ -181,6 +202,7 @@ func runCampaignAgent(ctx workflow.Context, request CampaignRequest, maxTurns in
 	logger := workflow.GetLogger(ctx)
 
 	var items []AgentItem
+	draft := CampaignDraft{}
 	lastRejection := "the agent never submitted a campaign"
 	for turn := 1; turn <= maxTurns; turn++ {
 		var turnResult RunCampaignAgentTurnResult
@@ -194,14 +216,15 @@ func runCampaignAgent(ctx workflow.Context, request CampaignRequest, maxTurns in
 			continue
 		}
 
-		results := make([]workflow.Future, len(turnResult.Calls))
-		for index, call := range turnResult.Calls {
-			results[index] = workflow.ExecuteActivity(toolCtx, ActivityExecuteCampaignTool, ExecuteCampaignToolInput{Request: request, Call: call})
-		}
+		// Calls run one at a time, in the order the model made them: a level is
+		// checked against the levels saved before it, including ones saved
+		// earlier in the same turn, and a submission sees every saved level.
 		var accepted *WordflowCampaignWorkflowInput
-		for index, call := range turnResult.Calls {
+		for _, call := range turnResult.Calls {
 			var result ExecuteCampaignToolResult
-			if err := results[index].Get(ctx, &result); err != nil {
+			if err := workflow.ExecuteActivity(toolCtx, ActivityExecuteCampaignTool, ExecuteCampaignToolInput{
+				Request: request, Draft: draft, Call: call,
+			}).Get(ctx, &result); err != nil {
 				return WordflowCampaignWorkflowInput{}, fmt.Errorf("%s tool %s: %w", request.Kind, call.Name, err)
 			}
 			items = append(items,
@@ -209,6 +232,8 @@ func runCampaignAgent(ctx workflow.Context, request CampaignRequest, maxTurns in
 				AgentItem{Type: AgentItemToolResult, CallID: call.CallID, Text: result.Output},
 			)
 			switch {
+			case result.SavedLevel != nil:
+				draft[result.SavedLevel.Number] = result.SavedLevel.Level
 			case result.Campaign != nil && accepted == nil:
 				accepted = result.Campaign
 			case call.Name == AgentToolSubmitCampaign && result.Campaign == nil:

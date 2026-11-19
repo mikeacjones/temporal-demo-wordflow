@@ -51,6 +51,7 @@ type agentRun struct {
 	toolResult func(AgentToolCall) ExecuteCampaignToolResult
 
 	requests        []CampaignRequest
+	drafts          []CampaignDraft // the draft each tool call received
 	turnInputs      []RunCampaignAgentTurnInput
 	executed        []AgentToolCall
 	startedCampaign WordflowCampaignWorkflowInput
@@ -69,6 +70,7 @@ func newAgentRun(now time.Time, previous CampaignGeneratorResult) *agentRun {
 	}, activity.RegisterOptions{Name: ActivityRunCampaignAgentTurn})
 	run.env.RegisterActivityWithOptions(func(_ context.Context, input ExecuteCampaignToolInput) (ExecuteCampaignToolResult, error) {
 		run.requests = append(run.requests, input.Request)
+		run.drafts = append(run.drafts, input.Draft)
 		run.executed = append(run.executed, input.Call)
 		return run.toolResult(input.Call), nil
 	}, activity.RegisterOptions{Name: ActivityExecuteCampaignTool})
@@ -120,17 +122,16 @@ func TestDailyGeneratorStartsTodaysChallengeAndHandsOnTenDaysOfAnswers(t *testin
 	require.Equal(t, GeneratedCampaign{CampaignID: "daily-challenge-2026-09-22", Answers: []string{"NEWWORD"}}, result.Recent[9])
 }
 
-func TestAgentChecksAndResubmitsAfterARejectionWithoutFailing(t *testing.T) {
+func TestAgentResubmitsAfterARejectionWithoutFailing(t *testing.T) {
 	generated := generatedCampaignFixture("daily-challenge-2026-09-22", "NEWWORD")
 	run := newAgentRun(time.Date(2026, 9, 22, 12, 0, 0, 0, torontoLocation), CampaignGeneratorResult{})
 	run.turns = []RunCampaignAgentTurnResult{
-		{Calls: []AgentToolCall{toolCall("words-1", AgentToolCheckWords), toolCall("level-1", AgentToolCheckLevel)}},
-		{Calls: []AgentToolCall{toolCall("submit-1", AgentToolSubmitCampaign)}},
+		{Calls: []AgentToolCall{toolCall("words-1", AgentToolFindWords), toolCall("submit-1", AgentToolSubmitCampaign)}},
 		{Calls: []AgentToolCall{toolCall("submit-2", AgentToolSubmitCampaign)}},
 	}
 	run.toolResult = func(call AgentToolCall) ExecuteCampaignToolResult {
 		if call.CallID == "submit-1" {
-			return ExecuteCampaignToolResult{Output: `{"accepted":false,"error":"level 3 pads its answers"}`}
+			return ExecuteCampaignToolResult{Output: `{"accepted":false,"problems":["levels [3] are not saved yet"]}`}
 		}
 		return acceptSubmission(generated)(call)
 	}
@@ -138,22 +139,62 @@ func TestAgentChecksAndResubmitsAfterARejectionWithoutFailing(t *testing.T) {
 	run.execute(campaign.KindDailyChallenge)
 
 	require.NoError(t, run.env.GetWorkflowError())
-	require.Len(t, run.turnInputs, 3)
+	require.Len(t, run.turnInputs, 2)
 	require.Equal(t, generated, run.startedCampaign)
-	require.Len(t, run.executed, 4, "both parallel checks and both submissions ran")
+	require.Len(t, run.executed, 3)
 
 	require.Empty(t, run.turnInputs[0].Items)
-	secondTurn := run.turnInputs[1].Items
 	require.Equal(t, []AgentItem{
-		{Type: AgentItemToolCall, CallID: "words-1", Name: AgentToolCheckWords, Arguments: `{"call":"words-1"}`},
+		{Type: AgentItemToolCall, CallID: "words-1", Name: AgentToolFindWords, Arguments: `{"call":"words-1"}`},
 		{Type: AgentItemToolResult, CallID: "words-1", Text: `{"ok":true}`},
-		{Type: AgentItemToolCall, CallID: "level-1", Name: AgentToolCheckLevel, Arguments: `{"call":"level-1"}`},
-		{Type: AgentItemToolResult, CallID: "level-1", Text: `{"ok":true}`},
-	}, secondTurn)
-	thirdTurn := run.turnInputs[2].Items
-	require.Len(t, thirdTurn, 6)
-	require.Equal(t, `{"accepted":false,"error":"level 3 pads its answers"}`, thirdTurn[5].Text,
-		"the agent sees why its submission was rejected")
+		{Type: AgentItemToolCall, CallID: "submit-1", Name: AgentToolSubmitCampaign, Arguments: `{"call":"submit-1"}`},
+		{Type: AgentItemToolResult, CallID: "submit-1", Text: `{"accepted":false,"problems":["levels [3] are not saved yet"]}`},
+	}, run.turnInputs[1].Items, "the agent sees why its submission was rejected")
+}
+
+func TestSavedLevelsReachLaterToolCallsInTheSameTurnAndAfter(t *testing.T) {
+	first := CampaignLevel{Title: "One", Letters: "ACEINORT", Words: []string{"REACTION"}}
+	replaced := CampaignLevel{Title: "One again", Letters: "ACEINORT", Words: []string{"CREATION"}}
+	second := CampaignLevel{Title: "Two", Letters: "ACELPRST", Words: []string{"SPECTRAL"}}
+	saves := map[string]SavedCampaignLevel{
+		"set-1": {Number: 1, Level: first},
+		"set-2": {Number: 2, Level: second},
+		"set-3": {Number: 1, Level: replaced},
+	}
+	generated := generatedCampaignFixture("daily-challenge-2026-09-22", "NEWWORD")
+	run := newAgentRun(time.Date(2026, 9, 22, 12, 0, 0, 0, torontoLocation), CampaignGeneratorResult{})
+	run.turns = []RunCampaignAgentTurnResult{
+		{Calls: []AgentToolCall{toolCall("set-1", AgentToolSetLevel), toolCall("set-2", AgentToolSetLevel), toolCall("rejected", AgentToolSetLevel)}},
+		{Calls: []AgentToolCall{toolCall("set-3", AgentToolSetLevel), toolCall("submit", AgentToolSubmitCampaign)}},
+	}
+	run.toolResult = func(call AgentToolCall) ExecuteCampaignToolResult {
+		if saved, ok := saves[call.CallID]; ok {
+			return ExecuteCampaignToolResult{Output: `{"ok":true}`, SavedLevel: &saved}
+		}
+		if call.CallID == "rejected" {
+			return ExecuteCampaignToolResult{Output: `{"ok":false}`}
+		}
+		return acceptSubmission(generated)(call)
+	}
+
+	run.execute(campaign.KindDailyChallenge)
+
+	require.NoError(t, run.env.GetWorkflowError())
+	require.Equal(t, generated, run.startedCampaign)
+	require.Equal(t, []string{"set-1", "set-2", "rejected", "set-3", "submit"}, callIDs(run.executed), "calls run in the order the model made them")
+	require.Empty(t, run.drafts[0])
+	require.Equal(t, CampaignDraft{1: first}, run.drafts[1], "a level saved earlier in the turn is in the draft")
+	require.Equal(t, CampaignDraft{1: first, 2: second}, run.drafts[2])
+	require.Equal(t, CampaignDraft{1: first, 2: second}, run.drafts[3], "a rejected level changes nothing")
+	require.Equal(t, CampaignDraft{1: replaced, 2: second}, run.drafts[4], "setting a level again replaces it")
+}
+
+func callIDs(calls []AgentToolCall) []string {
+	ids := make([]string, len(calls))
+	for index, call := range calls {
+		ids[index] = call.CallID
+	}
+	return ids
 }
 
 func TestAgentThatNeverSubmitsAValidCampaignFailsAfterItsTurnBudget(t *testing.T) {
@@ -168,7 +209,7 @@ func TestAgentThatNeverSubmitsAValidCampaignFailsAfterItsTurnBudget(t *testing.T
 			run := newAgentRun(time.Date(2026, 9, 22, 12, 0, 0, 0, torontoLocation), CampaignGeneratorResult{})
 			run.turns = []RunCampaignAgentTurnResult{{Calls: []AgentToolCall{toolCall("submit", AgentToolSubmitCampaign)}}}
 			run.toolResult = func(AgentToolCall) ExecuteCampaignToolResult {
-				return ExecuteCampaignToolResult{Output: `{"accepted":false,"error":"no answer uses all 8 letters"}`}
+				return ExecuteCampaignToolResult{Output: `{"accepted":false,"problems":["level 1: no answer uses all 8 letters"]}`}
 			}
 
 			run.execute(test.kind)
