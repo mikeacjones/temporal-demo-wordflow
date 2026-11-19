@@ -4,7 +4,7 @@ A Temporal-themed word-crossword game where every move a player makes is a
 Workflow Update, and an AI agent loop writes a new daily challenge every night.
 
 - Each level is a [Workflow](https://docs.temporal.io/workflows) started with
-  [Update-With-Start](https://docs.temporal.io/develop/go/message-passing#update-with-start);
+  [Update-With-Start](https://docs.temporal.io/develop/go/workflows/message-passing);
   guesses and hints are [Updates](https://docs.temporal.io/encyclopedia/workflow-message-passing#sending-updates),
   and a durable timer ends a timed level.
 - [Schedules](https://docs.temporal.io/schedule) start the daily challenge and
