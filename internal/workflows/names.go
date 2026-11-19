@@ -40,12 +40,13 @@ const (
 	SignalRequestVersionUpgrade = "request-version-upgrade"
 	SignalLeaderboardScore      = "record-score"
 
-	ActivityRegisterCampaign         = "RegisterCampaign"
-	ActivityUnregisterCampaign       = "UnregisterCampaign"
-	ActivityGenerateWordflowCampaign = "GenerateWordflowCampaign"
-	ActivityResolveWordflowLevel     = "ResolveWordflowLevel"
-	ActivitySpendPoints              = "SpendPoints"
-	ActivityPublishLeaderboard       = "PublishLeaderboard"
+	ActivityRegisterCampaign     = "RegisterCampaign"
+	ActivityUnregisterCampaign   = "UnregisterCampaign"
+	ActivityRunCampaignAgentTurn = "RunCampaignAgentTurn"
+	ActivityExecuteCampaignTool  = "ExecuteCampaignTool"
+	ActivityResolveWordflowLevel = "ResolveWordflowLevel"
+	ActivitySpendPoints          = "SpendPoints"
+	ActivityPublishLeaderboard   = "PublishLeaderboard"
 )
 
 const (
