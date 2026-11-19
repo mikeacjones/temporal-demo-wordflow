@@ -11,22 +11,21 @@ const (
 	TaskQueue            = "temporal-word-game"
 	WorkerDeploymentName = "temporal-word-game"
 
-	CatalogWorkflowName                = "CatalogWorkflow"
-	DailyWordflowChallengeWorkflowName = "DailyWordflowChallengeWorkflow"
-	WordflowCampaignWorkflowName       = "WordflowCampaignWorkflow"
-	PlayerWorkflowName                 = "PlayerWorkflow"
-	WordflowLevelWorkflowName          = "WordflowLevelWorkflow"
-	LeaderboardWorkflowName            = "LeaderboardWorkflow"
+	CatalogWorkflowName                   = "CatalogWorkflow"
+	WordflowCampaignGeneratorWorkflowName = "WordflowCampaignGeneratorWorkflow"
+	WordflowCampaignWorkflowName          = "WordflowCampaignWorkflow"
+	PlayerWorkflowName                    = "PlayerWorkflow"
+	WordflowLevelWorkflowName             = "WordflowLevelWorkflow"
+	LeaderboardWorkflowName               = "LeaderboardWorkflow"
 
-	QueryCampaignSummary             = "campaign-summary"
-	QueryCampaignView                = "campaign-view"
-	QueryCatalog                     = "catalog"
-	QueryCatalogWordflowLevel        = "catalog-wordflow-level"
-	QueryDailyWordflowChallengeState = "daily-wordflow-challenge-state"
-	QueryWordflowLevel               = "wordflow-level"
-	QueryPlayerState                 = "player-state"
-	QueryWordflowLevelState          = "wordflow-level-state"
-	QueryLeaderboard                 = "leaderboard"
+	QueryCampaignSummary      = "campaign-summary"
+	QueryCampaignView         = "campaign-view"
+	QueryCatalog              = "catalog"
+	QueryCatalogWordflowLevel = "catalog-wordflow-level"
+	QueryWordflowLevel        = "wordflow-level"
+	QueryPlayerState          = "player-state"
+	QueryWordflowLevelState   = "wordflow-level-state"
+	QueryLeaderboard          = "leaderboard"
 
 	UpdateOpenCatalog        = "open-catalog"
 	UpdateRegisterCampaign   = "register-campaign"
@@ -41,18 +40,23 @@ const (
 	SignalRequestVersionUpgrade = "request-version-upgrade"
 	SignalLeaderboardScore      = "record-score"
 
-	ActivityRegisterCampaign               = "RegisterCampaign"
-	ActivityUnregisterCampaign             = "UnregisterCampaign"
-	ActivityGenerateDailyWordflowChallenge = "GenerateDailyWordflowChallenge"
-	ActivityResolveWordflowLevel           = "ResolveWordflowLevel"
-	ActivitySpendPoints                    = "SpendPoints"
-	ActivityPublishLeaderboard             = "PublishLeaderboard"
+	ActivityRegisterCampaign         = "RegisterCampaign"
+	ActivityUnregisterCampaign       = "UnregisterCampaign"
+	ActivityGenerateWordflowCampaign = "GenerateWordflowCampaign"
+	ActivityResolveWordflowLevel     = "ResolveWordflowLevel"
+	ActivitySpendPoints              = "SpendPoints"
+	ActivityPublishLeaderboard       = "PublishLeaderboard"
 )
 
 const (
-	CatalogWorkflowID                = "catalog/global"
-	DailyWordflowChallengeWorkflowID = "daily-wordflow-challenge/global"
-	LeaderboardWorkflowID            = "leaderboard/global"
+	CatalogWorkflowID     = "catalog/global"
+	LeaderboardWorkflowID = "leaderboard/global"
+
+	// A Schedule appends its fire time to the generator's Workflow ID prefix.
+	CampaignGeneratorWorkflowIDPrefix = "wordflow-generator/"
+
+	DailyChallengeScheduleID = "wordflow-daily-challenge"
+	MonthlyPackScheduleID    = "wordflow-monthly-pack"
 )
 
 func PlayerWorkflowID(playerID string) string {
@@ -71,7 +75,7 @@ func WordflowLevelWorkflowID(playerID, campaignID string, level int) string {
 func Register(registry worker.Registry, versioned bool) {
 	if !versioned {
 		registry.RegisterWorkflowWithOptions(CatalogWorkflow, workflow.RegisterOptions{Name: CatalogWorkflowName})
-		registry.RegisterWorkflowWithOptions(DailyWordflowChallengeWorkflow, workflow.RegisterOptions{Name: DailyWordflowChallengeWorkflowName})
+		registry.RegisterWorkflowWithOptions(WordflowCampaignGeneratorWorkflow, workflow.RegisterOptions{Name: WordflowCampaignGeneratorWorkflowName})
 		registry.RegisterWorkflowWithOptions(WordflowCampaignWorkflow, workflow.RegisterOptions{Name: WordflowCampaignWorkflowName})
 		registry.RegisterWorkflowWithOptions(PlayerWorkflow, workflow.RegisterOptions{Name: PlayerWorkflowName})
 		registry.RegisterWorkflowWithOptions(WordflowLevelWorkflow, workflow.RegisterOptions{Name: WordflowLevelWorkflowName})
@@ -83,8 +87,8 @@ func Register(registry worker.Registry, versioned bool) {
 		Name:               CatalogWorkflowName,
 		VersioningBehavior: workflow.VersioningBehaviorPinned,
 	})
-	registry.RegisterWorkflowWithOptions(DailyWordflowChallengeWorkflow, workflow.RegisterOptions{
-		Name:               DailyWordflowChallengeWorkflowName,
+	registry.RegisterWorkflowWithOptions(WordflowCampaignGeneratorWorkflow, workflow.RegisterOptions{
+		Name:               WordflowCampaignGeneratorWorkflowName,
 		VersioningBehavior: workflow.VersioningBehaviorPinned,
 	})
 	registry.RegisterWorkflowWithOptions(WordflowCampaignWorkflow, workflow.RegisterOptions{

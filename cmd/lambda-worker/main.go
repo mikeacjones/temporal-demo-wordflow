@@ -37,7 +37,7 @@ func main() {
 			Provider:  temporalClients,
 			TaskQueue: options.TaskQueue,
 		})
-		options.RegisterActivity(&activities.DailyChallenges{})
+		options.RegisterActivity(&activities.CampaignGenerator{})
 		options.RegisterActivity(&activities.Points{Provider: temporalClients})
 		options.RegisterActivity(&activities.Leaderboard{
 			Provider:  temporalClients,
