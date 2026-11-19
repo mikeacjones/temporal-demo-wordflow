@@ -22,7 +22,7 @@ on first registration and used by the leaderboard.
 | Component | Owns | Lifetime |
 | --- | --- | --- |
 | `CatalogWorkflow` | Immutable campaign snapshots used to render campaign cards and authorize level starts | Singleton entity; Continue-As-New keeps history bounded |
-| `DailyWordflowChallengeWorkflow` | Generates dated daily challenges through OpenAI tool calls and starts their campaigns | Singleton entity; retains ten days of puzzles and Continue-As-New keeps history bounded |
+| `WordflowCampaignGeneratorWorkflow` | Generates one campaign (a daily challenge or a monthly pack) through OpenAI tool calls and starts it | One short run per Schedule fire; the Schedule hands each run the previous run's answers as its last completion result |
 | `WordflowCampaignWorkflow` | One campaign's levels, unlock schedule, prerequisites, availability dates, and expiration timer | Permanent campaigns stay open; time-bounded campaigns complete at expiration |
 | `PlayerWorkflow` | Password hash, display name, campaign progress, points, rewards, streaks, and the active level reference | Long-lived entity; Continue-As-New keeps history bounded |
 | `WordflowLevelWorkflow` | One player's level answers, guesses, revealed cells, hints, timing, scoring, and completion | Runs until the level is solved or its hard limit expires; can Continue-As-New after heavy use |
@@ -41,14 +41,24 @@ Catalog derives every player-specific campaign card in one Query, so the API
 does not fan out to each Campaign Workflow. A campaign with an end time removes
 its snapshot and completes when that time arrives.
 
-`DailyWordflowChallengeWorkflow` asks OpenAI to finish each generation turn by
-calling one strict `create_daily_wordflow_challenge` tool. The tool supplies only
-the campaign description and creative level content. The Activity validates the
-letter multisets, answer uniqueness, full-queue words, and connected crossword
-layouts, then applies the fixed daily rules in code. The singleton retains the
-last ten days of puzzles and rejects any generated answer used during that
-window. It starts each dated campaign as an abandoned child, then waits on a
-durable timer for the next Toronto midnight.
+Two Temporal Schedules create new campaigns. The worker creates them at startup
+if they do not exist and leaves existing ones untouched, so a pause or edit made
+in the Temporal UI survives a restart.
+
+| Schedule | Fires (America/Toronto) | Creates |
+| --- | --- | --- |
+| `wordflow-daily-challenge` | Every day at midnight | `daily-challenge-YYYY-MM-DD`: three hard levels, one attempt, 180-second limit, closes at the next midnight |
+| `wordflow-monthly-pack` | Midnight on the 1st | `monthly-pack-YYYY-MM`: nine levels on one theme, no time limit, permanent |
+
+Each fire starts `WordflowCampaignGeneratorWorkflow` with the campaign kind.
+It asks OpenAI to finish its turn by calling one strict `create_wordflow_campaign`
+tool, which supplies only the description and creative level content. The
+Activity validates the letter multisets, answer uniqueness, full-queue words, and
+connected crossword layouts, then applies the kind's fixed rules in code. The
+Workflow starts the campaign as an abandoned child and returns the recent
+answers (ten days of daily challenges, three monthly packs). Temporal passes
+that result to the Schedule's next run, which rejects any answer already used.
+Both Schedules skip a run that overlaps a still-running one.
 
 To start a level, the Player runs a short Activity that asks the Catalog to
 resolve the registered campaign snapshot against its compact progress. The
@@ -117,15 +127,19 @@ layouts, and starts the durable campaign entity:
 go run ./cmd/campaign -file campaigns/daily-challenge-2026-09-21.json
 ```
 
-To start the daily generator entity, set `OPENAI_API_KEY` on the worker and run
-the starter with the first campaign date. The Workflow keeps generating future
-dates automatically. `OPENAI_MODEL` is optional and defaults to
-`gpt-5.4-mini`.
+The worker refuses to start without `OPENAI_API_KEY`, because it creates the
+generation Schedules. `OPENAI_MODEL` is optional and defaults to `gpt-5.4-mini`.
+Start a worker, then run a Schedule now instead of waiting for its time:
 
 ```bash
 OPENAI_API_KEY=... make worker
-go run ./cmd/daily-challenge -date 2026-09-22
+temporal schedule trigger --schedule-id wordflow-daily-challenge
+temporal schedule trigger --schedule-id wordflow-monthly-pack
 ```
+
+A trigger creates the campaign for the current period. A second trigger in the
+same period fails when it tries to start the same campaign ID, after spending
+one generation.
 
 ## Implemented game rules
 
@@ -171,7 +185,7 @@ go run ./cmd/daily-challenge -date 2026-09-22
 ## Continue-As-New and deployments
 
 Each mutable workflow carries its complete state in one serializable structure.
-Catalog, Daily Challenge, Player, Level, and Leaderboard Workflows Continue-As-New when Temporal
+Catalog, Player, Level, and Leaderboard Workflows Continue-As-New when Temporal
 recommends it or when a new target Worker Deployment Version is available. A
 level can Continue-As-New while it is active. The player does not Continue-As-New
 while it has an active level child; it waits for the child result while remaining
@@ -220,7 +234,7 @@ The web app includes an application-aware Workflow Explorer at
 <http://localhost:8080/workflows/>.
 It reads Visibility, Describe, and Event History data without issuing Workflow
 Queries, Updates, or Signals. Anonymous visitors can inspect sanitized catalog,
-campaign, daily-generator, and leaderboard executions. A browser carrying a
+campaign, campaign-generator, and leaderboard executions. A browser carrying a
 valid Wordflow session cookie can also inspect that player's Player and Level
 Workflows. Event details are decoded and sanitized at the API boundary;
 credentials, puzzle answers, headers, identities, failure messages, memos, and
@@ -246,7 +260,7 @@ make workflowcheck
 
 [`cmd/lambda-worker/main.go`](cmd/lambda-worker/main.go) uses Temporal's
 `lambdaworker` package. It registers the exact same workflows as the local
-worker, including the daily-generation, point-spend, and leaderboard-publishing Activities, while enabling the pinned
+worker, including the campaign-generation, point-spend, and leaderboard-publishing Activities, while enabling the pinned
 versioning behavior required by Serverless Workers.
 
 Build an AWS Lambda custom-runtime zip without generating any AWS deployment
@@ -265,7 +279,7 @@ environment variables:
 - `TEMPORAL_API_KEY`
 - `TEMPORAL_TASK_QUEUE=temporal-word-game`
 - `TEMPORAL_WORKER_BUILD_ID`, uniquely identifying this immutable Lambda build
-- `OPENAI_API_KEY`, used only by the daily-challenge generation Activity
+- `OPENAI_API_KEY`, used only by the campaign-generation Activity
 - `OPENAI_MODEL`, optional; defaults to `gpt-5.4-mini`
 
 Publish the function as an immutable Lambda version and map that qualified ARN
